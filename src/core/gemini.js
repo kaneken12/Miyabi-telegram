@@ -9,7 +9,7 @@ const personality = require('./personality');
 class GeminiService {
     constructor() {
         this.genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-        this.model  = this.genAI.getGenerativeModel({ model: 'gemini-2.5-flash-lite' });
+        this.model  = this.genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
         // Historique par chat_id
         this.histories = new Map();
     }
