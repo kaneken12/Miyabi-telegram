@@ -23,11 +23,9 @@ class GeminiService {
             const history = this.histories.get(chatId);
 
             const chat = this.model.startChat({
-                history,
-                systemInstruction: personality.getSystemPrompt(),
-                generationConfig: { maxOutputTokens: 512 }
-            });
-
+    history,
+    generationConfig: { maxOutputTokens: 512 }
+});
             const result  = await chat.sendMessage(userText);
             const response = result.response.text();
 
