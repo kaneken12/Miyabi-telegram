@@ -28,6 +28,8 @@ class GeminiService {
 });
             const result  = await chat.sendMessage(userText);
             const response = result.response.text();
+const fullText = `${personality.getSystemPrompt()}\n\nUtilisateur: ${userText}`;
+const result = await chat.sendMessage(fullText);
 
             // Sauvegarder dans l'historique
             history.push({ role: 'user',  parts: [{ text: userText }] });
