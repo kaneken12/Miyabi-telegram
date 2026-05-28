@@ -12,7 +12,7 @@ class GeminiService {
         try {
             if (!this.histories.has(chatId)) this.histories.set(chatId, []);
             const history = this.histories.get(chatId);
-            const chat = this.model.startChat({ history, generationConfig: { maxOutputTokens: 512 } });
+            const chat = this.model.startChat({ history, generationConfig: { maxOutputTokens: 900 } });
             const fullText = `${personality.getSystemPrompt()}\n\nUtilisateur: ${userText}`;
             const res = await chat.sendMessage(fullText);
             const response = res.response.text();
