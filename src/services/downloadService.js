@@ -1,6 +1,6 @@
 // ============================================================
 //  src/services/downloadService.js
-//  Téléchargement depuis lien OU depuis recherche textuelle
+//  Compatible Termux + Render (pas de dépendances système)
 // ============================================================
 
 const YTDlpWrap = require('yt-dlp-wrap').default;
@@ -14,6 +14,18 @@ const MAX_SIZE_MB = 50;
 
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
+// ── Configurer ffmpeg selon l'environnement ──────────────────
+// Sur Render : utilise @ffmpeg-installer/ffmpeg (binaire npm)
+// Sur Termux : utilise ffmpeg système (déjà installé)
+try {
+    const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+    ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+    logger.info('[DL] ffmpeg via @ffmpeg-installer');
+} catch (_) {
+    // Termux — ffmpeg système déjà dispo dans le PATH
+    logger.info('[DL] ffmpeg via système (Termux)');
+}
+
 function detectPlatform(url) {
     if (/youtube\.com|youtu\.be/i.test(url))  return 'YouTube';
     if (/facebook\.com|fb\.watch/i.test(url)) return 'Facebook';
@@ -26,14 +38,46 @@ function detectPlatform(url) {
 
 class DownloadService {
     constructor() {
-        this.ytdlp = new YTDlpWrap();
+        this.ytdlp      = new YTDlpWrap();
+        this.ytdlpReady = false;
+        this._initYtdlp();
+    }
+
+    // ── Initialiser yt-dlp (télécharge le binaire si absent) ─
+    async _initYtdlp() {
+        try {
+            // Vérifie si yt-dlp est disponible dans le système (Termux)
+            await this.ytdlp.execPromise(['--version']);
+            this.ytdlpReady = true;
+            logger.info('[DL] yt-dlp système détecté');
+        } catch (_) {
+            // Pas disponible → télécharger le binaire depuis GitHub (Render)
+            try {
+                logger.info('[DL] Téléchargement yt-dlp binaire...');
+                await YTDlpWrap.downloadFromGithub(
+                    path.join(__dirname, '../../bin/yt-dlp')
+                );
+                this.ytdlp = new YTDlpWrap(
+                    path.join(__dirname, '../../bin/yt-dlp')
+                );
+                this.ytdlpReady = true;
+                logger.info('[DL] yt-dlp binaire téléchargé');
+            } catch (err) {
+                logger.error('[DL] yt-dlp indisponible:', err.message);
+            }
+        }
+    }
+
+    // ── Source yt-dlp (URL ou recherche textuelle) ────────────
+    _buildSource(urlOrQuery) {
+        if (urlOrQuery.startsWith('http')) return urlOrQuery;
+        return `ytsearch1:${urlOrQuery}`;
     }
 
     // ── Infos sans télécharger ───────────────────────────────
     async getInfo(urlOrQuery) {
         try {
-            const source = this._buildSource(urlOrQuery);
-            const info   = await this.ytdlp.getVideoInfo(source);
+            const info = await this.ytdlp.getVideoInfo(this._buildSource(urlOrQuery));
             return {
                 title:    info.title    || 'Média',
                 duration: info.duration || 0,
@@ -42,28 +86,23 @@ class DownloadService {
                 platform: detectPlatform(info.webpage_url || urlOrQuery),
                 url:      info.webpage_url || urlOrQuery,
             };
-        } catch {
-            return null;
-        }
+        } catch { return null; }
     }
 
-    // ── Télécharger une vidéo (lien OU recherche textuelle) ──
+    // ── Télécharger une vidéo ────────────────────────────────
     async downloadVideo(urlOrQuery) {
-        const source   = this._buildSource(urlOrQuery);
-        const outPath  = path.join(TMP_DIR, `miyabi_${Date.now()}.mp4`);
-        const isSearch = !urlOrQuery.startsWith('http');
-
-        logger.info(`[DL] 📥 Vidéo ${isSearch ? '🔍 ' + urlOrQuery : urlOrQuery}`);
+        const source  = this._buildSource(urlOrQuery);
+        const outPath = path.join(TMP_DIR, `miyabi_${Date.now()}.mp4`);
+        logger.info(`[DL] 📥 Vidéo : ${urlOrQuery}`);
 
         try {
-            const args = [
+            await this.ytdlp.execPromise([
                 source,
                 '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]',
                 '--merge-output-format', 'mp4',
                 '-o', outPath,
                 '--no-playlist',
-            ];
-            await this.ytdlp.execPromise(args);
+            ]);
 
             if (!fs.existsSync(outPath)) return { success: false, error: 'FILE_NOT_FOUND' };
 
@@ -81,7 +120,6 @@ class DownloadService {
                 platform: info?.platform || 'YouTube',
                 sizeMB:   sizeMB.toFixed(1),
             };
-
         } catch (err) {
             logger.error('[DL] downloadVideo erreur:', err.message);
             if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
@@ -89,23 +127,20 @@ class DownloadService {
         }
     }
 
-    // ── Télécharger uniquement l'audio (lien OU recherche) ───
+    // ── Télécharger uniquement l'audio ───────────────────────
     async downloadAudio(urlOrQuery) {
-        const source   = this._buildSource(urlOrQuery);
-        const outPath  = path.join(TMP_DIR, `miyabi_${Date.now()}.mp3`);
-        const isSearch = !urlOrQuery.startsWith('http');
-
-        logger.info(`[DL] 🎵 Audio ${isSearch ? '🔍 ' + urlOrQuery : urlOrQuery}`);
+        const source  = this._buildSource(urlOrQuery);
+        const outPath = path.join(TMP_DIR, `miyabi_${Date.now()}.mp3`);
+        logger.info(`[DL] 🎵 Audio : ${urlOrQuery}`);
 
         try {
-            const args = [
+            await this.ytdlp.execPromise([
                 source,
                 '-x', '--audio-format', 'mp3',
                 '--audio-quality', '192K',
                 '-o', outPath,
                 '--no-playlist',
-            ];
-            await this.ytdlp.execPromise(args);
+            ]);
 
             if (!fs.existsSync(outPath)) return { success: false, error: 'FILE_NOT_FOUND' };
 
@@ -118,7 +153,6 @@ class DownloadService {
                 platform: info?.platform || 'YouTube',
                 sizeMB:   sizeMB.toFixed(1),
             };
-
         } catch (err) {
             logger.error('[DL] downloadAudio erreur:', err.message);
             if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
@@ -126,7 +160,7 @@ class DownloadService {
         }
     }
 
-    // ── Convertir vidéo reçue → MP3 ─────────────────────────
+    // ── Convertir vidéo → MP3 ────────────────────────────────
     async convertToAudio(inputPath) {
         const outPath = path.join(TMP_DIR, `miyabi_conv_${Date.now()}.mp3`);
         logger.info(`[DL] 🔄 Conversion : ${inputPath}`);
@@ -147,14 +181,6 @@ class DownloadService {
                 })
                 .run();
         });
-    }
-
-    // ── Construire la source yt-dlp ──────────────────────────
-    // Si c'est une URL → on l'utilise directement
-    // Si c'est une recherche → ytsearch1:"requête"
-    _buildSource(urlOrQuery) {
-        if (urlOrQuery.startsWith('http')) return urlOrQuery;
-        return `ytsearch1:${urlOrQuery}`;
     }
 
     // ── Nettoyage tmp > 15 min ───────────────────────────────
