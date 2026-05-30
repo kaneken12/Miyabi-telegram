@@ -1,33 +1,27 @@
 // ============================================================
-//  src/services/downloadService.js — Miyabi Telegram
-//  Téléchargement YouTube, Facebook, Pinterest via yt-dlp
+//  src/services/downloadService.js
+//  Téléchargement depuis lien OU depuis recherche textuelle
 // ============================================================
 
-const YTDlpWrap  = require('yt-dlp-wrap').default;
-const path       = require('path');
-const fs         = require('fs');
-const logger     = require('../utils/logger');
+const YTDlpWrap = require('yt-dlp-wrap').default;
+const ffmpeg    = require('fluent-ffmpeg');
+const path      = require('path');
+const fs        = require('fs');
+const logger    = require('../utils/logger');
 
-const TMP_DIR    = path.join(__dirname, '../../tmp');
-const MAX_SIZE_MB = 50; // Limite Telegram bots = 50 MB
+const TMP_DIR     = path.join(__dirname, '../../tmp');
+const MAX_SIZE_MB = 50;
 
-// S'assurer que le dossier tmp existe
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
-// Détecter la plateforme depuis l'URL
 function detectPlatform(url) {
-    if (/youtube\.com|youtu\.be/i.test(url))   return 'youtube';
-    if (/facebook\.com|fb\.watch/i.test(url))  return 'facebook';
-    if (/pinterest\.com|pin\.it/i.test(url))   return 'pinterest';
-    if (/instagram\.com/i.test(url))            return 'instagram';
-    if (/tiktok\.com/i.test(url))               return 'tiktok';
-    if (/twitter\.com|x\.com/i.test(url))       return 'twitter';
-    return 'unknown';
-}
-
-// Nettoyer un nom de fichier
-function sanitizeFilename(name) {
-    return name.replace(/[^a-zA-Z0-9_\-\.]/g, '_').substring(0, 60);
+    if (/youtube\.com|youtu\.be/i.test(url))  return 'YouTube';
+    if (/facebook\.com|fb\.watch/i.test(url)) return 'Facebook';
+    if (/pinterest\.com|pin\.it/i.test(url))  return 'Pinterest';
+    if (/instagram\.com/i.test(url))           return 'Instagram';
+    if (/tiktok\.com/i.test(url))              return 'TikTok';
+    if (/twitter\.com|x\.com/i.test(url))      return 'Twitter';
+    return 'YouTube';
 }
 
 class DownloadService {
@@ -35,190 +29,153 @@ class DownloadService {
         this.ytdlp = new YTDlpWrap();
     }
 
-    // ── Récupérer les infos sans télécharger ─────────────────
-    async getInfo(url) {
+    // ── Infos sans télécharger ───────────────────────────────
+    async getInfo(urlOrQuery) {
         try {
-            const info = await this.ytdlp.getVideoInfo(url);
+            const source = this._buildSource(urlOrQuery);
+            const info   = await this.ytdlp.getVideoInfo(source);
             return {
-                title:     info.title     || 'Vidéo',
-                duration:  info.duration  || 0,
-                uploader:  info.uploader  || '',
-                thumbnail: info.thumbnail || '',
-                filesize:  info.filesize_approx || 0,
-                platform:  detectPlatform(url),
+                title:    info.title    || 'Média',
+                duration: info.duration || 0,
+                uploader: info.uploader || '',
+                filesize: info.filesize_approx || 0,
+                platform: detectPlatform(info.webpage_url || urlOrQuery),
+                url:      info.webpage_url || urlOrQuery,
             };
-        } catch (err) {
-            logger.error('[DOWNLOAD] getInfo erreur:', err.message);
+        } catch {
             return null;
         }
     }
 
-    // ── Télécharger une vidéo ────────────────────────────────
-    async downloadVideo(url) {
-        const platform = detectPlatform(url);
+    // ── Télécharger une vidéo (lien OU recherche textuelle) ──
+    async downloadVideo(urlOrQuery) {
+        const source   = this._buildSource(urlOrQuery);
         const outPath  = path.join(TMP_DIR, `miyabi_${Date.now()}.mp4`);
+        const isSearch = !urlOrQuery.startsWith('http');
 
-        logger.info(`[DOWNLOAD] 📥 Vidéo ${platform} : ${url}`);
+        logger.info(`[DL] 📥 Vidéo ${isSearch ? '🔍 ' + urlOrQuery : urlOrQuery}`);
 
         try {
-            // Vérifier la taille avant téléchargement
-            const info = await this.getInfo(url);
-            if (info?.filesize && info.filesize / (1024*1024) > MAX_SIZE_MB) {
-                return { success: false, error: 'FILE_TOO_LARGE', sizeMB: (info.filesize/1024/1024).toFixed(1) };
-            }
-
-            // Options selon la plateforme
-            const args = this._buildArgs(url, outPath, platform, 'video');
+            const args = [
+                source,
+                '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]',
+                '--merge-output-format', 'mp4',
+                '-o', outPath,
+                '--no-playlist',
+            ];
             await this.ytdlp.execPromise(args);
 
-            if (!fs.existsSync(outPath))
-                return { success: false, error: 'FILE_NOT_FOUND' };
+            if (!fs.existsSync(outPath)) return { success: false, error: 'FILE_NOT_FOUND' };
 
-            const stat   = fs.statSync(outPath);
-            const sizeMB = stat.size / (1024 * 1024);
-
+            const sizeMB = fs.statSync(outPath).size / (1024 * 1024);
             if (sizeMB > MAX_SIZE_MB) {
                 fs.unlinkSync(outPath);
                 return { success: false, error: 'FILE_TOO_LARGE', sizeMB: sizeMB.toFixed(1) };
             }
 
+            const info = await this.getInfo(source).catch(() => null);
             return {
                 success:  true,
                 path:     outPath,
-                title:    info?.title || 'Vidéo',
-                platform,
+                title:    info?.title    || urlOrQuery,
+                platform: info?.platform || 'YouTube',
                 sizeMB:   sizeMB.toFixed(1),
             };
 
         } catch (err) {
-            logger.error('[DOWNLOAD] downloadVideo erreur:', err.message);
+            logger.error('[DL] downloadVideo erreur:', err.message);
             if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
-            return { success: false, error: 'DOWNLOAD_FAILED', detail: err.message };
+            return { success: false, error: 'DOWNLOAD_FAILED' };
         }
     }
 
-    // ── Télécharger uniquement l'audio (YouTube) ─────────────
-    async downloadAudio(url) {
-        const platform = detectPlatform(url);
+    // ── Télécharger uniquement l'audio (lien OU recherche) ───
+    async downloadAudio(urlOrQuery) {
+        const source   = this._buildSource(urlOrQuery);
         const outPath  = path.join(TMP_DIR, `miyabi_${Date.now()}.mp3`);
+        const isSearch = !urlOrQuery.startsWith('http');
 
-        logger.info(`[DOWNLOAD] 🎵 Audio ${platform} : ${url}`);
-
-        try {
-            const args = this._buildArgs(url, outPath, platform, 'audio');
-            await this.ytdlp.execPromise(args);
-
-            if (!fs.existsSync(outPath))
-                return { success: false, error: 'FILE_NOT_FOUND' };
-
-            const stat   = fs.statSync(outPath);
-            const sizeMB = stat.size / (1024 * 1024);
-
-            const info = await this.getInfo(url).catch(() => null);
-
-            return {
-                success:  true,
-                path:     outPath,
-                title:    info?.title || 'Audio',
-                platform,
-                sizeMB:   sizeMB.toFixed(1),
-            };
-
-        } catch (err) {
-            logger.error('[DOWNLOAD] downloadAudio erreur:', err.message);
-            if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
-            return { success: false, error: 'DOWNLOAD_FAILED', detail: err.message };
-        }
-    }
-
-    // ── Télécharger une image (Pinterest, etc.) ───────────────
-    async downloadImage(url) {
-        const platform = detectPlatform(url);
-        const outPath  = path.join(TMP_DIR, `miyabi_${Date.now()}.jpg`);
-
-        logger.info(`[DOWNLOAD] 🖼️  Image ${platform} : ${url}`);
+        logger.info(`[DL] 🎵 Audio ${isSearch ? '🔍 ' + urlOrQuery : urlOrQuery}`);
 
         try {
             const args = [
-                url,
-                '--write-thumbnail',
-                '--skip-download',
-                '--convert-thumbnails', 'jpg',
-                '-o', outPath.replace('.jpg', ''),
-            ];
-            await this.ytdlp.execPromise(args);
-
-            // yt-dlp ajoute l'extension automatiquement
-            const finalPath = outPath.replace('.jpg', '.jpg');
-            if (!fs.existsSync(finalPath))
-                return { success: false, error: 'FILE_NOT_FOUND' };
-
-            return { success: true, path: finalPath, platform };
-
-        } catch (err) {
-            logger.error('[DOWNLOAD] downloadImage erreur:', err.message);
-            return { success: false, error: 'DOWNLOAD_FAILED', detail: err.message };
-        }
-    }
-
-    // ── Construire les arguments yt-dlp ──────────────────────
-    _buildArgs(url, outPath, platform, type) {
-        if (type === 'audio') {
-            return [
-                url,
+                source,
                 '-x', '--audio-format', 'mp3',
                 '--audio-quality', '192K',
                 '-o', outPath,
                 '--no-playlist',
             ];
+            await this.ytdlp.execPromise(args);
+
+            if (!fs.existsSync(outPath)) return { success: false, error: 'FILE_NOT_FOUND' };
+
+            const info   = await this.getInfo(source).catch(() => null);
+            const sizeMB = fs.statSync(outPath).size / (1024 * 1024);
+            return {
+                success:  true,
+                path:     outPath,
+                title:    info?.title    || urlOrQuery,
+                platform: info?.platform || 'YouTube',
+                sizeMB:   sizeMB.toFixed(1),
+            };
+
+        } catch (err) {
+            logger.error('[DL] downloadAudio erreur:', err.message);
+            if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
+            return { success: false, error: 'DOWNLOAD_FAILED' };
         }
-
-        // Vidéo — qualité max 720p pour rester sous 50 MB
-        const baseArgs = [
-            url,
-            '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]',
-            '--merge-output-format', 'mp4',
-            '-o', outPath,
-            '--no-playlist',
-        ];
-
-        // Pinterest : récupérer directement la vidéo du pin
-        if (platform === 'pinterest') {
-            return [
-                url,
-                '-f', 'best',
-                '-o', outPath,
-            ];
-        }
-
-        // Facebook : forcer le format mp4
-        if (platform === 'facebook') {
-            return [
-                url,
-                '-f', 'best[ext=mp4]/best',
-                '-o', outPath,
-                '--no-playlist',
-            ];
-        }
-
-        return baseArgs;
     }
 
-    // ── Nettoyer les fichiers tmp anciens (> 10 min) ──────────
+    // ── Convertir vidéo reçue → MP3 ─────────────────────────
+    async convertToAudio(inputPath) {
+        const outPath = path.join(TMP_DIR, `miyabi_conv_${Date.now()}.mp3`);
+        logger.info(`[DL] 🔄 Conversion : ${inputPath}`);
+
+        return new Promise((resolve) => {
+            ffmpeg(inputPath)
+                .noVideo()
+                .audioCodec('libmp3lame')
+                .audioBitrate('192k')
+                .output(outPath)
+                .on('end', () => {
+                    logger.info('[DL] ✅ Conversion terminée');
+                    resolve({ success: true, path: outPath });
+                })
+                .on('error', (err) => {
+                    logger.error('[DL] Conversion erreur:', err.message);
+                    resolve({ success: false, error: 'CONVERT_FAILED' });
+                })
+                .run();
+        });
+    }
+
+    // ── Construire la source yt-dlp ──────────────────────────
+    // Si c'est une URL → on l'utilise directement
+    // Si c'est une recherche → ytsearch1:"requête"
+    _buildSource(urlOrQuery) {
+        if (urlOrQuery.startsWith('http')) return urlOrQuery;
+        return `ytsearch1:${urlOrQuery}`;
+    }
+
+    // ── Nettoyage tmp > 15 min ───────────────────────────────
     cleanTmp() {
         const now = Date.now();
         try {
             fs.readdirSync(TMP_DIR).forEach(file => {
-                const fp   = path.join(TMP_DIR, file);
-                const stat = fs.statSync(fp);
-                if (now - stat.mtimeMs > 10 * 60 * 1000) {
+                const fp = path.join(TMP_DIR, file);
+                if (now - fs.statSync(fp).mtimeMs > 15 * 60 * 1000) {
                     fs.unlinkSync(fp);
-                    logger.info(`[DOWNLOAD] 🗑️  Tmp nettoyé : ${file}`);
+                    logger.info(`[DL] 🗑️  Tmp nettoyé : ${file}`);
                 }
             });
         } catch (e) {
-            logger.warn('[DOWNLOAD] cleanTmp erreur:', e.message);
+            logger.warn('[DL] cleanTmp erreur:', e.message);
         }
+    }
+
+    cleanup(filePath) {
+        try { if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath); }
+        catch (_) {}
     }
 }
 
