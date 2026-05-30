@@ -1,18 +1,21 @@
 // ============================================================
-//  src/handlers/messageHandler.js — Miyabi Telegram
-//  Routage des commandes et messages
+//  src/handlers/messageHandler.js — Miyabi Telegram v2
+//  Tout en langage naturel — Gemini détecte les intentions
 // ============================================================
 
-const gemini          = require('../core/gemini');
-const personality     = require('../core/personality');
-const downloadService = require('../services/downloadService');
-const searchService   = require('../services/searchService');
-const groupService    = require('../services/groupService');
+const gemini             = require('../core/gemini');
+const personality        = require('../core/personality');
+const downloadService    = require('../services/downloadService');
+const searchService      = require('../services/searchService');
+const groupService       = require('../services/groupService');
 const { inspectMessage } = require('../utils/messageSanitizer');
-const logger          = require('../utils/logger');
+const logger             = require('../utils/logger');
+const axios              = require('axios');
+const path               = require('path');
+const fs                 = require('fs');
 
-// Regex de détection de liens téléchargeables
-const DL_REGEX = /(https?:\/\/(www\.)?(youtube\.com|youtu\.be|facebook\.com|fb\.watch|pinterest\.com|pin\.it|instagram\.com|tiktok\.com|twitter\.com|x\.com)[^\s]*)/i;
+const URL_REGEX = /(https?:\/\/[^\s]+)/i;
+const TMP_DIR   = path.join(__dirname, '../../tmp');
 
 class MessageHandler {
 
@@ -20,307 +23,338 @@ class MessageHandler {
         try {
             const chatId   = msg.chat.id;
             const userId   = msg.from?.id;
-            const text     = msg.text || msg.caption || '';
             const isGroup  = ['group', 'supergroup'].includes(msg.chat.type);
             const isOwner  = String(userId) === String(process.env.OWNER_ID);
-            const botInfo  = await bot.getMe();
-            const botUsername = `@${botInfo.username}`;
+
+            const firstName = msg.from?.first_name || '';
+            const lastName  = msg.from?.last_name  || '';
+            const userName  = `${firstName}${lastName ? ' ' + lastName : ''}`.trim() || `User${userId}`;
+            gemini.setUserName(userId, userName);
 
             // ── SANITISATION ──────────────────────────────
             const check = inspectMessage(msg);
             if (check.suspicious) {
-                logger.warn(`⚠️  [SANITIZER] Message suspect — chat:${chatId} user:${userId} — ${check.reason}`);
-                try {
-                    await bot.deleteMessage(chatId, msg.message_id);
-                    logger.info(`🗑️  [SANITIZER] Message supprimé.`);
-                } catch (e) {
-                    logger.warn('[SANITIZER] Suppression impossible:', e.message);
-                }
+                logger.warn(`⚠️ [SANITIZER] ${check.reason}`);
+                try { await bot.deleteMessage(chatId, msg.message_id); } catch (_) {}
                 return;
             }
 
             // ── QUARANTAINE ───────────────────────────────
             if (isGroup && userId && groupService.isInQuarantine(chatId, userId)) {
-                logger.info(`[GUARD] 🔒 Message bloqué (quarantaine) userId:${userId}`);
-                try {
-                    await bot.deleteMessage(chatId, msg.message_id);
-                } catch (e) { /* silencieux */ }
+                try { await bot.deleteMessage(chatId, msg.message_id); } catch (_) {}
                 return;
             }
 
+            // ════════════════════════════════════════════
+            //  FICHIERS REÇUS DIRECTEMENT (sans lien)
+            // ════════════════════════════════════════════
+
+            // ── Vidéo reçue ───────────────────────────────
+            if (msg.video) {
+                await this._handleReceivedVideo(bot, msg, chatId, userId, userName);
+                return;
+            }
+
+            // ── Audio / message vocal reçu ────────────────
+            if (msg.audio || msg.voice) {
+                await this._handleReceivedAudio(bot, msg, chatId);
+                return;
+            }
+
+            // ── Document vidéo ou audio reçu ─────────────
+            if (msg.document) {
+                const mime = msg.document.mime_type || '';
+                if (mime.startsWith('video/')) {
+                    await this._handleReceivedVideo(bot, msg, chatId, userId, userName);
+                    return;
+                }
+                if (mime.startsWith('audio/')) {
+                    await this._handleReceivedAudio(bot, msg, chatId);
+                    return;
+                }
+            }
+
+            // ════════════════════════════════════════════
+            //  MESSAGES TEXTE
+            // ════════════════════════════════════════════
+            const text = msg.text || msg.caption || '';
             if (!text) return;
 
-            // ── En groupe : répondre seulement si mentionné
-            //    ou si commande slash
-            if (isGroup && !text.startsWith('/') && !text.includes(botUsername)) return;
-
-            // Nettoyer la mention du bot du texte
-            const cleanText = text.replace(botUsername, '').trim();
-
-            // ── ROUTAGE DES COMMANDES ─────────────────────
-            if (cleanText.startsWith('/')) {
-                await this._handleCommand(bot, msg, cleanText, chatId, userId, isGroup, isOwner);
-                return;
+            // En groupe : seulement si mentionné
+            if (isGroup) {
+                const botInfo = await bot.getMe();
+                if (!text.includes(`@${botInfo.username}`)) return;
             }
 
-            // ── DÉTECTION DE LIEN DE TÉLÉCHARGEMENT ──────
-            const dlMatch = cleanText.match(DL_REGEX);
-            if (dlMatch) {
-                await this._handleDownload(bot, msg, dlMatch[0], chatId);
-                return;
-            }
+            const botInfo   = await bot.getMe();
+            const cleanText = text.replace(`@${botInfo.username}`, '').trim();
 
-            // ── RÉPONSE GEMINI ────────────────────────────
-            await this._handleChat(bot, msg, cleanText, chatId);
+            await bot.sendChatAction(chatId, 'typing');
+
+            const result = await gemini.chat(userId, cleanText, userName);
+
+            switch (result.intent) {
+
+                case 'DOWNLOAD_VIDEO': {
+                    const url = result.data || this._extractUrl(cleanText);
+                    if (!url) { await this._send(bot, chatId, msg, result.response); return; }
+                    await this._send(bot, chatId, msg, result.response);
+                    await this._downloadAndSend(bot, chatId, url, 'video');
+                    break;
+                }
+
+                case 'DOWNLOAD_AUDIO': {
+                    const url = result.data || this._extractUrl(cleanText);
+                    if (!url) { await this._send(bot, chatId, msg, result.response); return; }
+                    await this._send(bot, chatId, msg, result.response);
+                    await this._downloadAndSend(bot, chatId, url, 'audio');
+                    break;
+                }
+
+                case 'CONVERT_TO_AUDIO':
+                    await this._send(bot, chatId, msg, result.response);
+                    await bot.sendMessage(chatId, 'Envoie-moi la vidéo à convertir.');
+                    break;
+
+                case 'WEB_SEARCH': {
+                    const query = result.data || cleanText;
+                    await this._send(bot, chatId, msg, result.response);
+                    await this._doSearch(bot, chatId, query);
+                    break;
+                }
+
+                case 'GROUP_LOCK': {
+                    if (!isGroup) { await this._send(bot, chatId, msg, 'On est pas dans un groupe.'); return; }
+                    const isAdmin = await groupService.isUserAdmin(bot, chatId, userId);
+                    if (!isAdmin && !isOwner) { await this._send(bot, chatId, msg, personality.getErrorMessage('NOT_AUTHORIZED')); return; }
+                    const r = await groupService.lockGroup(bot, chatId);
+                    await this._send(bot, chatId, msg, r.success ? result.response : `Echec : ${r.error}`);
+                    break;
+                }
+
+                case 'GROUP_UNLOCK': {
+                    if (!isGroup) { await this._send(bot, chatId, msg, 'On est pas dans un groupe.'); return; }
+                    const isAdmin = await groupService.isUserAdmin(bot, chatId, userId);
+                    if (!isAdmin && !isOwner) { await this._send(bot, chatId, msg, personality.getErrorMessage('NOT_AUTHORIZED')); return; }
+                    const r = await groupService.unlockGroup(bot, chatId);
+                    await this._send(bot, chatId, msg, r.success ? result.response : `Echec : ${r.error}`);
+                    break;
+                }
+
+                case 'GROUP_INFO': {
+                    if (!isGroup) { await this._send(bot, chatId, msg, 'On est pas dans un groupe.'); return; }
+                    const info = await groupService.getGroupInfo(bot, chatId);
+                    if (!info.success) { await this._send(bot, chatId, msg, 'Impossible de récupérer les infos.'); return; }
+                    const infoText = `${result.response}\n\n📊 *${info.title}*\n👥 ${info.members} membres\n🔑 ${info.admins} admins\n🔒 ${info.inQ} en quarantaine`;
+                    await this._send(bot, chatId, msg, infoText, true);
+                    break;
+                }
+
+                case 'RESET_CHAT':
+                    gemini.clearHistory(userId);
+                    await this._send(bot, chatId, msg, result.response);
+                    break;
+
+                default:
+                    await this._send(bot, chatId, msg, result.response);
+            }
 
         } catch (err) {
             logger.error('[HANDLER] Erreur:', err.message);
         }
     }
 
-    // ══════════════════════════════════════════════
-    //  COMMANDES
-    // ══════════════════════════════════════════════
-    async _handleCommand(bot, msg, text, chatId, userId, isGroup, isOwner) {
-        const args    = text.split(' ');
-        const command = args[0].toLowerCase().split('@')[0]; // /cmd@bot → /cmd
-        const params  = args.slice(1).join(' ').trim();
+    // ════════════════════════════════════════════════════════
+    //  VIDÉO REÇUE — Proposer : garder vidéo OU convertir MP3
+    // ════════════════════════════════════════════════════════
+    async _handleReceivedVideo(bot, msg, chatId, userId, userName) {
+        try {
+            const fileId   = msg.video?.file_id || msg.document?.file_id;
+            const fileName = msg.document?.file_name || 'vidéo';
+            const sizeMB   = ((msg.video?.file_size || msg.document?.file_size || 0) / (1024 * 1024)).toFixed(1);
 
-        switch (command) {
+            // Miyabi répond avec sa personnalité + boutons inline
+            const reply = await gemini.quickReply(
+                `${userName} t'envoie une vidéo (${sizeMB} MB). Réponds brièvement que tu l'as reçue et demande ce qu'il veut en faire : la garder en vidéo ou extraire l'audio en MP3.`
+            );
 
-            // ── Info & aide ───────────────────────────────
-            case '/start':
-            case '/help':
-                await bot.sendMessage(chatId,
-                    `*Miyabi Bot*\n\n` +
-                    `*Téléchargement*\n` +
-                    `\`/dl [lien]\` — Télécharger une vidéo \\(YouTube, Facebook, Pinterest\\)\n` +
-                    `\`/mp3 [lien]\` — Télécharger l'audio \\(YouTube\\)\n\n` +
-                    `*Recherche*\n` +
-                    `\`/search [requête]\` — Recherche web\n\n` +
-                    `*Groupe \\(admins\\)*\n` +
-                    `\`/lock\` — Verrouiller le groupe\n` +
-                    `\`/unlock\` — Déverrouiller le groupe\n` +
-                    `\`/info\` — Infos du groupe\n` +
-                    `\`/guard\` — Activer la protection\n\n` +
-                    `*Conversation*\n` +
-                    `\`/reset\` — Réinitialiser la conversation\n` +
-                    `Ou mentionne\\-moi simplement dans un groupe\\.`,
-                    { parse_mode: 'MarkdownV2' }
-                );
-                break;
-
-            // ── Téléchargement vidéo ──────────────────────
-            case '/dl':
-            case '/video': {
-                const url = params || this._extractUrl(text);
-                if (!url) {
-                    await bot.sendMessage(chatId, 'Donne-moi un lien. Usage : `/dl [url]`', { parse_mode: 'Markdown' });
-                    return;
+            await bot.sendMessage(chatId, reply, {
+                reply_to_message_id: msg.message_id,
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '🎬 Garder en vidéo',  callback_data: `keep_video:${fileId}` },
+                        { text: '🎵 Extraire en MP3',  callback_data: `to_audio:${fileId}` },
+                    ]]
                 }
-                await this._handleDownload(bot, msg, url, chatId, 'video');
-                break;
-            }
+            });
 
-            // ── Téléchargement audio ──────────────────────
-            case '/mp3':
-            case '/audio': {
-                const url = params || this._extractUrl(text);
-                if (!url) {
-                    await bot.sendMessage(chatId, 'Donne-moi un lien YouTube. Usage : `/mp3 [url]`', { parse_mode: 'Markdown' });
-                    return;
-                }
-                await this._handleDownload(bot, msg, url, chatId, 'audio');
-                break;
-            }
-
-            // ── Recherche web ─────────────────────────────
-            case '/search':
-            case '/s': {
-                if (!params) {
-                    await bot.sendMessage(chatId, 'Quoi chercher ? Usage : `/search [requête]`', { parse_mode: 'Markdown' });
-                    return;
-                }
-                await this._handleSearch(bot, chatId, params);
-                break;
-            }
-
-            // ── Verrouiller groupe ────────────────────────
-            case '/lock': {
-                if (!isGroup) { await bot.sendMessage(chatId, 'Commande réservée aux groupes.'); return; }
-                const isAdmin = await groupService.isUserAdmin(bot, chatId, userId);
-                if (!isAdmin && !isOwner) { await bot.sendMessage(chatId, personality.getErrorMessage('NOT_AUTHORIZED')); return; }
-                const result = await groupService.lockGroup(bot, chatId);
-                await bot.sendMessage(chatId, result.success
-                    ? '🔒 Groupe verrouillé. Seuls les admins peuvent écrire.'
-                    : `Echec : ${result.error}`
-                );
-                break;
-            }
-
-            // ── Déverrouiller groupe ──────────────────────
-            case '/unlock': {
-                if (!isGroup) { await bot.sendMessage(chatId, 'Commande réservée aux groupes.'); return; }
-                const isAdmin = await groupService.isUserAdmin(bot, chatId, userId);
-                if (!isAdmin && !isOwner) { await bot.sendMessage(chatId, personality.getErrorMessage('NOT_AUTHORIZED')); return; }
-                const result = await groupService.unlockGroup(bot, chatId);
-                await bot.sendMessage(chatId, result.success
-                    ? '🔓 Groupe ouvert. Tout le monde peut écrire.'
-                    : `Echec : ${result.error}`
-                );
-                break;
-            }
-
-            // ── Infos groupe ──────────────────────────────
-            case '/info': {
-                if (!isGroup) { await bot.sendMessage(chatId, 'Commande réservée aux groupes.'); return; }
-                const info = await groupService.getGroupInfo(bot, chatId);
-                if (!info.success) { await bot.sendMessage(chatId, 'Impossible de récupérer les infos.'); return; }
-                await bot.sendMessage(chatId,
-                    `📊 *${info.title}*\n` +
-                    `👥 Membres : ${info.members}\n` +
-                    `🔑 Admins : ${info.admins}\n` +
-                    `🔒 En quarantaine : ${info.inQ}`,
-                    { parse_mode: 'Markdown' }
-                );
-                break;
-            }
-
-            // ── Activer la protection ─────────────────────
-            case '/guard': {
-                if (!isGroup) { await bot.sendMessage(chatId, 'Commande réservée aux groupes.'); return; }
-                const isAdmin = await groupService.isUserAdmin(bot, chatId, userId);
-                if (!isAdmin && !isOwner) { await bot.sendMessage(chatId, personality.getErrorMessage('NOT_AUTHORIZED')); return; }
-                await bot.sendMessage(chatId,
-                    '🛡️ Protection activée.\nJe surveille les expulsions, les nouveaux membres et les messages suspects.'
-                );
-                break;
-            }
-
-            // ── Reset conversation Gemini ─────────────────
-            case '/reset':
-                gemini.clearHistory(chatId);
-                await bot.sendMessage(chatId, '...Conversation réinitialisée. Comme si on ne s\'était jamais parlé.');
-                break;
-
-            // ── Humeur actuelle ───────────────────────────
-            case '/mood':
-                await bot.sendMessage(chatId, `Humeur actuelle : *${personality.getCurrentEmotion().name}*`, { parse_mode: 'Markdown' });
-                break;
-
-            default:
-                // Commande inconnue → Gemini
-                await this._handleChat(bot, msg, text, chatId);
+        } catch (err) {
+            logger.error('[HANDLER] _handleReceivedVideo erreur:', err.message);
         }
     }
 
-    // ══════════════════════════════════════════════
-    //  TÉLÉCHARGEMENT
-    // ══════════════════════════════════════════════
-    async _handleDownload(bot, msg, url, chatId, forceType = null) {
-        const platform = this._detectPlatform(url);
-        const type     = forceType || (platform === 'pinterest' ? 'video' : 'video');
-
-        const waiting = await bot.sendMessage(chatId, `⏳ Téléchargement en cours...`);
-
+    // ════════════════════════════════════════════════════════
+    //  AUDIO / VOCAL REÇU — Télécharger et renvoyer proprement
+    // ════════════════════════════════════════════════════════
+    async _handleReceivedAudio(bot, msg, chatId) {
+        const waiting = await bot.sendMessage(chatId, '⏳ Traitement audio...', {
+            reply_to_message_id: msg.message_id,
+        });
         try {
-            let result;
+            const isVoice  = !!msg.voice;
+            const fileId   = msg.audio?.file_id || msg.voice?.file_id;
+            const title    = msg.audio?.title    || msg.audio?.file_name || (isVoice ? 'Message vocal' : 'Audio');
+            const performer = msg.audio?.performer || '';
+            const sizeMB   = ((msg.audio?.file_size || msg.voice?.file_size || 0) / (1024 * 1024)).toFixed(1);
 
-            if (type === 'audio') {
-                result = await downloadService.downloadAudio(url);
-            } else {
-                result = await downloadService.downloadVideo(url);
-            }
+            // Télécharger depuis Telegram
+            const fileLink = await bot.getFileLink(fileId);
+            const outPath  = path.join(TMP_DIR, `miyabi_audio_${Date.now()}.mp3`);
 
-            // Supprimer le message d'attente
+            const response = await axios({ url: fileLink, responseType: 'stream', timeout: 60000 });
+            const writer   = fs.createWriteStream(outPath);
+            response.data.pipe(writer);
+            await new Promise((res, rej) => { writer.on('finish', res); writer.on('error', rej); });
+
             await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
 
-            if (!result.success) {
-                const errorMsg = result.error === 'FILE_TOO_LARGE'
-                    ? `Fichier trop lourd (${result.sizeMB} MB). Limite Telegram : 50 MB.`
-                    : personality.getErrorMessage('DOWNLOAD_FAILED');
-                await bot.sendMessage(chatId, errorMsg);
-                return;
-            }
+            // Renvoyer l'audio proprement formaté
+            await bot.sendAudio(chatId, outPath, {
+                caption:    `🎵 ${title}${performer ? ' — ' + performer : ''}\n_${sizeMB} MB_`,
+                parse_mode: 'Markdown',
+                title,
+                performer,
+                reply_to_message_id: msg.message_id,
+            });
 
-            // Envoyer le fichier
-            const caption = `📥 *${result.title}*\n_${result.platform} • ${result.sizeMB} MB_`;
-
-            if (type === 'audio') {
-                await bot.sendAudio(chatId, result.path, {
-                    caption,
-                    parse_mode: 'Markdown',
-                    title: result.title,
-                });
-            } else {
-                await bot.sendVideo(chatId, result.path, {
-                    caption,
-                    parse_mode: 'Markdown',
-                    supports_streaming: true,
-                });
-            }
-
-            // Nettoyer le fichier tmp
-            const fs = require('fs');
-            if (fs.existsSync(result.path)) fs.unlinkSync(result.path);
+            downloadService.cleanup(outPath);
 
         } catch (err) {
-            logger.error('[HANDLER] _handleDownload erreur:', err.message);
+            logger.error('[HANDLER] _handleReceivedAudio erreur:', err.message);
             await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
             await bot.sendMessage(chatId, personality.getErrorMessage('DOWNLOAD_FAILED'));
         }
     }
 
-    // ══════════════════════════════════════════════
-    //  RECHERCHE
-    // ══════════════════════════════════════════════
-    async _handleSearch(bot, chatId, query) {
-        const waiting = await bot.sendMessage(chatId, `🔍 Recherche en cours...`);
+    // ════════════════════════════════════════════════════════
+    //  CALLBACK — Boutons inline (garder vidéo / convertir)
+    // ════════════════════════════════════════════════════════
+    async handleCallback(bot, query) {
+        const chatId = query.message?.chat?.id;
+        const data   = query.data || '';
+        await bot.answerCallbackQuery(query.id);
 
-        const result = await searchService.search(query);
-        await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
+        if (data.startsWith('keep_video:')) {
+            const fileId  = data.replace('keep_video:', '');
+            const waiting = await bot.sendMessage(chatId, '⏳ Téléchargement...');
+            try {
+                const fileLink = await bot.getFileLink(fileId);
+                const outPath  = path.join(TMP_DIR, `miyabi_vid_${Date.now()}.mp4`);
 
-        if (!result.success) {
-            await bot.sendMessage(chatId, personality.getErrorMessage('SEARCH_FAILED'));
-            return;
+                const response = await axios({ url: fileLink, responseType: 'stream', timeout: 120000 });
+                const writer   = fs.createWriteStream(outPath);
+                response.data.pipe(writer);
+                await new Promise((res, rej) => { writer.on('finish', res); writer.on('error', rej); });
+
+                await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
+                await bot.sendVideo(chatId, outPath, {
+                    caption: '🎬 Voilà.',
+                    supports_streaming: true,
+                });
+                downloadService.cleanup(outPath);
+            } catch (err) {
+                logger.error('[CALLBACK] keep_video erreur:', err.message);
+                await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
+                await bot.sendMessage(chatId, personality.getErrorMessage('DOWNLOAD_FAILED'));
+            }
         }
 
-        const text = `🔍 *${result.title}*\n\n${result.text}` +
-            (result.url ? `\n\n[Source](${result.url})` : '');
+        if (data.startsWith('to_audio:')) {
+            const fileId  = data.replace('to_audio:', '');
+            const waiting = await bot.sendMessage(chatId, '🔄 Conversion en MP3...');
+            try {
+                const fileLink = await bot.getFileLink(fileId);
+                const tmpVid   = path.join(TMP_DIR, `miyabi_conv_in_${Date.now()}.mp4`);
 
-        await bot.sendMessage(chatId, text, {
-            parse_mode: 'Markdown',
-            disable_web_page_preview: false,
-        });
+                const response = await axios({ url: fileLink, responseType: 'stream', timeout: 120000 });
+                const writer   = fs.createWriteStream(tmpVid);
+                response.data.pipe(writer);
+                await new Promise((res, rej) => { writer.on('finish', res); writer.on('error', rej); });
+
+                const result = await downloadService.convertToAudio(tmpVid);
+                await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
+                downloadService.cleanup(tmpVid);
+
+                if (!result.success) {
+                    await bot.sendMessage(chatId, personality.getErrorMessage('DOWNLOAD_FAILED'));
+                    return;
+                }
+
+                await bot.sendAudio(chatId, result.path, { caption: '🎵 Conversion terminée.' });
+                downloadService.cleanup(result.path);
+
+            } catch (err) {
+                logger.error('[CALLBACK] to_audio erreur:', err.message);
+                await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
+                await bot.sendMessage(chatId, personality.getErrorMessage('DOWNLOAD_FAILED'));
+            }
+        }
     }
 
-    // ══════════════════════════════════════════════
-    //  GEMINI CHAT
-    // ══════════════════════════════════════════════
-    async _handleChat(bot, msg, text, chatId) {
+    // ── Télécharger depuis un lien ────────────────────────────
+    async _downloadAndSend(bot, chatId, url, type) {
+        const waiting = await bot.sendMessage(chatId, `⏳ ${type === 'audio' ? 'Extraction audio' : 'Téléchargement'}...`);
         try {
-            await bot.sendChatAction(chatId, 'typing');
-            const response = await gemini.chat(chatId, text);
-            await bot.sendMessage(chatId, response, {
-                reply_to_message_id: msg.message_id,
-            });
+            const result = type === 'audio'
+                ? await downloadService.downloadAudio(url)
+                : await downloadService.downloadVideo(url);
+
+            await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
+
+            if (!result.success) {
+                const errMsg = result.error === 'FILE_TOO_LARGE'
+                    ? `Trop lourd (${result.sizeMB} MB). Max 50 MB.`
+                    : personality.getErrorMessage('DOWNLOAD_FAILED');
+                await bot.sendMessage(chatId, errMsg);
+                return;
+            }
+
+            const caption = `📥 *${result.title}*\n_${result.platform} • ${result.sizeMB} MB_`;
+            if (type === 'audio') {
+                await bot.sendAudio(chatId, result.path, { caption, parse_mode: 'Markdown', title: result.title });
+            } else {
+                await bot.sendVideo(chatId, result.path, { caption, parse_mode: 'Markdown', supports_streaming: true });
+            }
+            downloadService.cleanup(result.path);
+
         } catch (err) {
-            logger.error('[HANDLER] _handleChat erreur:', err.message);
-            await bot.sendMessage(chatId, personality.getErrorMessage('UNKNOWN'));
+            logger.error('[HANDLER] _downloadAndSend erreur:', err.message);
+            await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
+            await bot.sendMessage(chatId, personality.getErrorMessage('DOWNLOAD_FAILED'));
         }
     }
 
-    // ── Utils ────────────────────────────────────
-    _extractUrl(text) {
-        const match = text.match(/https?:\/\/[^\s]+/);
-        return match ? match[0] : null;
+    // ── Recherche web ─────────────────────────────────────────
+    async _doSearch(bot, chatId, query) {
+        const result = await searchService.search(query);
+        if (!result.success) { await bot.sendMessage(chatId, personality.getErrorMessage('SEARCH_FAILED')); return; }
+        const text = `🔍 *${result.title}*\n\n${result.text}` + (result.url ? `\n\n[Source](${result.url})` : '');
+        await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', disable_web_page_preview: false });
     }
 
-    _detectPlatform(url) {
-        if (/youtube\.com|youtu\.be/i.test(url))   return 'youtube';
-        if (/facebook\.com|fb\.watch/i.test(url))  return 'facebook';
-        if (/pinterest\.com|pin\.it/i.test(url))   return 'pinterest';
-        return 'other';
+    async _send(bot, chatId, msg, text, markdown = false) {
+        try {
+            const opts = { reply_to_message_id: msg.message_id };
+            if (markdown) opts.parse_mode = 'Markdown';
+            await bot.sendMessage(chatId, text, opts);
+        } catch (err) {
+            logger.error('[HANDLER] _send erreur:', err.message);
+        }
+    }
+
+    _extractUrl(text) {
+        const match = text.match(URL_REGEX);
+        return match ? match[0] : null;
     }
 }
 
