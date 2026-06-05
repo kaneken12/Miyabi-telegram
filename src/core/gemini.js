@@ -1,35 +1,41 @@
 // ============================================================
 //  src/core/gemini.js — Miyabi Telegram v2
-//  Deux appels séparés : détection d'intention + réponse
+//  UN seul appel Gemini — parsing robuste
 // ============================================================
 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const logger      = require('../utils/logger');
 const personality = require('./personality');
 
-// ── Prompt de détection d'intention (appel 1) ────────────────
-const INTENT_DETECTION_PROMPT = `Tu es un classificateur d'intentions. Analyse le message et retourne UNIQUEMENT un objet JSON valide sur une seule ligne. Aucun texte avant ou après. Aucun backtick. Aucune explication.
+const INTENT_PROMPT = `
+INSTRUCTIONS STRICTES :
+Si le message contient une demande d'action, réponds UNIQUEMENT avec ce JSON sur une ligne :
+{"intent":"ACTION","data":"valeur","response":"ta réponse naturelle"}
 
-Format : {"intent":"ACTION","data":"valeur"}
+Si c'est une conversation normale, réponds UNIQUEMENT avec du texte normal, sans JSON.
 
-Actions :
-- DOWNLOAD_AUDIO : télécharger une musique/audio. data = "artiste titre" ex: "Sleep Token Damocles"
-- DOWNLOAD_VIDEO : télécharger une vidéo. data = URL ou description courte en anglais
-- CONVERT_TO_AUDIO : convertir une vidéo en audio. data = "convert"
-- WEB_SEARCH : recherche sur internet. data = la requête de recherche
-- GROUP_LOCK : verrouiller le groupe. data = "lock"
-- GROUP_UNLOCK : déverrouiller le groupe. data = "unlock"
+Actions reconnues :
+- DOWNLOAD_AUDIO : musique/audio demandé. data = "artiste titre"
+- DOWNLOAD_VIDEO : vidéo demandée. data = URL ou "description en anglais"
+- CONVERT_TO_AUDIO : convertir vidéo en audio. data = "convert"
+- WEB_SEARCH : recherche internet. data = "requête"
+- GROUP_LOCK : verrouiller groupe. data = "lock"
+- GROUP_UNLOCK : déverrouiller groupe. data = "unlock"
 - GROUP_INFO : infos du groupe. data = "info"
-- RESET_CHAT : réinitialiser la conversation. data = "reset"
-- NONE : aucune action spécifique. data = ""
+- RESET_CHAT : réinitialiser conversation. data = "reset"
 
-Exemples :
-"envoie moi Careless de Neffex" → {"intent":"DOWNLOAD_AUDIO","data":"Neffex Careless"}
-"je veux regarder le clip de Blinding Lights" → {"intent":"DOWNLOAD_VIDEO","data":"The Weeknd Blinding Lights official video"}
-"cherche les news d'aujourd'hui" → {"intent":"WEB_SEARCH","data":"latest news today"}
-"verrouille le groupe" → {"intent":"GROUP_LOCK","data":"lock"}
-"bonjour comment tu vas" → {"intent":"NONE","data":""}
-"c'est quoi la capitale de la France" → {"intent":"NONE","data":""}`;
+Exemples stricts :
+Message: "envoie Careless de Neffex"
+Réponse: {"intent":"DOWNLOAD_AUDIO","data":"Neffex Careless","response":"*soupir* Tiens, White."}
+
+Message: "bonjour comment tu vas"
+Réponse: Bien. Qu'est-ce que tu veux, White ?
+
+Message: "cherche les dernières news"
+Réponse: {"intent":"WEB_SEARCH","data":"latest news today","response":"Je cherche ça, White."}
+
+RAPPEL : JSON = action détectée. Texte pur = conversation normale. Jamais les deux mélangés.
+`;
 
 class GeminiService {
     constructor() {
@@ -43,28 +49,7 @@ class GeminiService {
     getUserName(userId)       { return this.userNames.get(userId) || null; }
     isMother(userId)          { return String(userId) === String(process.env.MOTHER_ID); }
 
-    // ── Appel 1 : Détecter l'intention ───────────────────────
-    async detectIntent(userText) {
-        try {
-            const res = await this.model.generateContent({
-                contents: [{ role: 'user', parts: [{ text: `${INTENT_DETECTION_PROMPT}\n\nMessage: ${userText}` }] }],
-                generationConfig: { maxOutputTokens: 100, temperature: 0.1 }
-            });
-            const raw = res.response.text().trim()
-                .replace(/```json/g, '')
-                .replace(/```/g, '')
-                .trim();
-
-            const parsed = JSON.parse(raw);
-            if (parsed.intent) return parsed;
-            return { intent: 'NONE', data: '' };
-        } catch (err) {
-            logger.warn('[GEMINI] detectIntent erreur:', err.message);
-            return { intent: 'NONE', data: '' };
-        }
-    }
-
-    // ── Appel 2 : Générer la réponse de Miyabi ───────────────
+    // ── Un seul appel : réponse + intent combinés ─────────────
     async chat(userId, userText, userName) {
         try {
             if (userName && !this.userNames.has(userId))
@@ -77,24 +62,26 @@ class GeminiService {
                 history,
                 generationConfig: {
                     maxOutputTokens: 1024,
-                    temperature:     1.2,
-                    topK:            60,
+                    temperature:     1.3,
+                    topK:            50,
                     topP:            0.92,
                 }
             });
 
-            const prompt = `${personality.getSystemPrompt()}\n\nUtilisateur (${userName || 'Inconnu'}): ${userText}`;
+            const prompt = `${personality.getSystemPrompt()}\n${INTENT_PROMPT}\n\nUtilisateur (${userName || 'Inconnu'}): ${userText}`;
             const res    = await chat.sendMessage(prompt);
-            const response = res.response.text().trim();
+            const raw    = res.response.text().trim();
 
+            // Sauvegarder dans l'historique
             history.push({ role: 'user',  parts: [{ text: userText }] });
-            history.push({ role: 'model', parts: [{ text: response }] });
+            history.push({ role: 'model', parts: [{ text: raw }] });
             if (history.length > 40) history.splice(0, 2);
 
-            return response;
+            return this._parse(raw);
+
         } catch (err) {
             logger.error('[GEMINI] chat erreur:', err.message);
-            return personality.getErrorMessage('UNKNOWN');
+            return { intent: null, data: null, response: personality.getErrorMessage('UNKNOWN') };
         }
     }
 
@@ -109,6 +96,41 @@ class GeminiService {
             logger.error('[GEMINI] quickReply erreur:', err.message);
             return personality.getErrorMessage('UNKNOWN');
         }
+    }
+
+    // ── Parser robuste ───────────────────────────────────────
+    _parse(raw) {
+        // Nettoyer backticks
+        const cleaned = raw.replace(/```json/g, '').replace(/```/g, '').trim();
+
+        // Chercher un JSON avec "intent"
+        const start = cleaned.indexOf('{"intent"');
+        if (start !== -1) {
+            // Trouver la fin du JSON
+            let depth = 0, end = -1;
+            for (let i = start; i < cleaned.length; i++) {
+                if (cleaned[i] === '{') depth++;
+                if (cleaned[i] === '}') { depth--; if (depth === 0) { end = i + 1; break; } }
+            }
+            if (end > start) {
+                try {
+                    const parsed = JSON.parse(cleaned.slice(start, end));
+                    if (parsed.intent && parsed.response) {
+                        return { intent: parsed.intent, data: parsed.data || null, response: parsed.response };
+                    }
+                } catch (_) {}
+            }
+        }
+
+        // Essayer de parser toute la réponse
+        try {
+            const parsed = JSON.parse(cleaned);
+            if (parsed.intent && parsed.response)
+                return { intent: parsed.intent, data: parsed.data || null, response: parsed.response };
+        } catch (_) {}
+
+        // Réponse texte normale
+        return { intent: null, data: null, response: raw };
     }
 
     clearHistory(userId) { this.histories.delete(userId); }
