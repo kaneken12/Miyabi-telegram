@@ -76,9 +76,9 @@ class GeminiService {
             const chat = this.model.startChat({
                 history,
                 generationConfig: {
-                    maxOutputTokens: 500,
-                    temperature:     1.3,
-                    topK:            50,
+                    maxOutputTokens: 1024,
+                    temperature:     1.2,
+                    topK:            60,
                     topP:            0.92,
                 }
             });
