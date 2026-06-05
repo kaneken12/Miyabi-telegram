@@ -43,27 +43,30 @@ class DownloadService {
         this._initYtdlp();
     }
 
-    // ── Initialiser yt-dlp (télécharge le binaire si absent) ─
+    // ── Initialiser yt-dlp ──────────────────────────────────
     async _initYtdlp() {
         try {
-            // Vérifie si yt-dlp est disponible dans le système (Termux)
             await this.ytdlp.execPromise(['--version']);
             this.ytdlpReady = true;
             logger.info('[DL] yt-dlp système détecté');
         } catch (_) {
-            // Pas disponible → télécharger le binaire depuis GitHub (Render)
             try {
-                logger.info('[DL] Téléchargement yt-dlp binaire...');
-                await YTDlpWrap.downloadFromGithub(
-                    path.join(__dirname, '../../bin/yt-dlp')
-                );
-                this.ytdlp = new YTDlpWrap(
-                    path.join(__dirname, '../../bin/yt-dlp')
-                );
+                const binDir = path.join(__dirname, '../../bin');
+                if (!fs.existsSync(binDir)) fs.mkdirSync(binDir, { recursive: true });
+                const binPath = path.join(binDir, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+                logger.info('[DL] Téléchargement yt-dlp...');
+                await YTDlpWrap.downloadFromGithub(binPath);
+                this.ytdlp = new YTDlpWrap(binPath);
+                // Rendre exécutable sur Linux
+                if (process.platform !== 'win32') {
+                    const { execSync } = require('child_process');
+                    execSync(`chmod +x ${binPath}`);
+                }
                 this.ytdlpReady = true;
-                logger.info('[DL] yt-dlp binaire téléchargé');
+                logger.info('[DL] yt-dlp téléchargé avec succès');
             } catch (err) {
                 logger.error('[DL] yt-dlp indisponible:', err.message);
+                this.ytdlpReady = false;
             }
         }
     }
