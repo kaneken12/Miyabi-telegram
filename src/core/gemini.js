@@ -1,47 +1,35 @@
 // ============================================================
 //  src/core/gemini.js — Miyabi Telegram v2
-//  gemini-2.0-flash — détection d'intention naturelle
+//  Deux appels séparés : détection d'intention + réponse
 // ============================================================
 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const logger      = require('../utils/logger');
 const personality = require('./personality');
 
-const INTENT_PROMPT = `
-En plus de répondre normalement, si le message contient une demande d'action spécifique,
-retourne ta réponse sous ce format JSON EXACT :
+// ── Prompt de détection d'intention (appel 1) ────────────────
+const INTENT_DETECTION_PROMPT = `Tu es un classificateur d'intentions. Analyse le message et retourne UNIQUEMENT un objet JSON valide sur une seule ligne. Aucun texte avant ou après. Aucun backtick. Aucune explication.
 
-{"intent":"ACTION","data":"valeur","response":"ta réponse naturelle ici"}
+Format : {"intent":"ACTION","data":"valeur"}
 
-Actions disponibles :
-
-- DOWNLOAD_VIDEO : télécharger ou envoyer une vidéo.
-  * Depuis un lien URL → data = l'URL complète
-  * Depuis une description ("envoie-moi la vidéo de course de voiture", "montre-moi le clip de ...") → data = la requête de recherche en anglais de préférence
-  
-- DOWNLOAD_AUDIO : télécharger ou envoyer une musique / audio.
-  * Depuis un lien URL → data = l'URL complète
-  * Depuis une description ("envoie Careless de Neffex", "je veux écouter ...", "mets-moi la chanson ...") → data = "artiste - titre" en anglais de préférence
-
+Actions :
+- DOWNLOAD_AUDIO : télécharger une musique/audio. data = "artiste titre" ex: "Sleep Token Damocles"
+- DOWNLOAD_VIDEO : télécharger une vidéo. data = URL ou description courte en anglais
 - CONVERT_TO_AUDIO : convertir une vidéo en audio. data = "convert"
-
-- WEB_SEARCH : recherche sur internet. data = la requête
-
+- WEB_SEARCH : recherche sur internet. data = la requête de recherche
 - GROUP_LOCK : verrouiller le groupe. data = "lock"
 - GROUP_UNLOCK : déverrouiller le groupe. data = "unlock"
 - GROUP_INFO : infos du groupe. data = "info"
 - RESET_CHAT : réinitialiser la conversation. data = "reset"
+- NONE : aucune action spécifique. data = ""
 
-IMPORTANT : Pour les demandes musicales ou vidéo sans lien, extrais toujours le nom de l'artiste
-et le titre ou une description précise dans le champ data.
 Exemples :
-- "envoie Careless de Neffex" → data = "Neffex Careless"
-- "je veux écouter Demons d'Imagine Dragons" → data = "Imagine Dragons Demons"  
-- "envoie la vidéo du clip de Blinding Lights" → data = "The Weeknd Blinding Lights official video"
-- "montre-moi une vidéo de course de voiture" → data = "car race video"
-
-Si aucune action n'est détectée, réponds normalement en texte sans JSON.
-`;
+"envoie moi Careless de Neffex" → {"intent":"DOWNLOAD_AUDIO","data":"Neffex Careless"}
+"je veux regarder le clip de Blinding Lights" → {"intent":"DOWNLOAD_VIDEO","data":"The Weeknd Blinding Lights official video"}
+"cherche les news d'aujourd'hui" → {"intent":"WEB_SEARCH","data":"latest news today"}
+"verrouille le groupe" → {"intent":"GROUP_LOCK","data":"lock"}
+"bonjour comment tu vas" → {"intent":"NONE","data":""}
+"c'est quoi la capitale de la France" → {"intent":"NONE","data":""}`;
 
 class GeminiService {
     constructor() {
@@ -55,7 +43,29 @@ class GeminiService {
     getUserName(userId)       { return this.userNames.get(userId) || null; }
     isMother(userId)          { return String(userId) === String(process.env.MOTHER_ID); }
 
-    async chat(userId, userText, userName = null) {
+    // ── Appel 1 : Détecter l'intention ───────────────────────
+    async detectIntent(userText) {
+        try {
+            const res = await this.model.generateContent({
+                contents: [{ role: 'user', parts: [{ text: `${INTENT_DETECTION_PROMPT}\n\nMessage: ${userText}` }] }],
+                generationConfig: { maxOutputTokens: 100, temperature: 0.1 }
+            });
+            const raw = res.response.text().trim()
+                .replace(/```json/g, '')
+                .replace(/```/g, '')
+                .trim();
+
+            const parsed = JSON.parse(raw);
+            if (parsed.intent) return parsed;
+            return { intent: 'NONE', data: '' };
+        } catch (err) {
+            logger.warn('[GEMINI] detectIntent erreur:', err.message);
+            return { intent: 'NONE', data: '' };
+        }
+    }
+
+    // ── Appel 2 : Générer la réponse de Miyabi ───────────────
+    async chat(userId, userText, userName) {
         try {
             if (userName && !this.userNames.has(userId))
                 this.userNames.set(userId, userName);
@@ -65,48 +75,40 @@ class GeminiService {
 
             const chat = this.model.startChat({
                 history,
-                generationConfig: { maxOutputTokens: 600 }
+                generationConfig: {
+                    maxOutputTokens: 500,
+                    temperature:     1.3,
+                    topK:            50,
+                    topP:            0.92,
+                }
             });
 
-            const fullPrompt = `${personality.getSystemPrompt()}\n${INTENT_PROMPT}\n\nUtilisateur (${userName || 'Inconnu'}): ${userText}`;
-            const res        = await chat.sendMessage(fullPrompt);
-            const raw        = res.response.text().trim();
+            const prompt = `${personality.getSystemPrompt()}\n\nUtilisateur (${userName || 'Inconnu'}): ${userText}`;
+            const res    = await chat.sendMessage(prompt);
+            const response = res.response.text().trim();
 
             history.push({ role: 'user',  parts: [{ text: userText }] });
-            history.push({ role: 'model', parts: [{ text: raw }] });
+            history.push({ role: 'model', parts: [{ text: response }] });
             if (history.length > 40) history.splice(0, 2);
 
-            return this._parseResponse(raw);
-
+            return response;
         } catch (err) {
-            logger.error('[GEMINI] Erreur chat:', err.message);
-            return { intent: null, response: personality.getErrorMessage('UNKNOWN') };
+            logger.error('[GEMINI] chat erreur:', err.message);
+            return personality.getErrorMessage('UNKNOWN');
         }
     }
 
+    // ── Réponse rapide sans historique ───────────────────────
     async quickReply(prompt) {
         try {
             const res = await this.model.generateContent(
                 `${personality.getSystemPrompt()}\n\n${prompt}`
             );
-            return res.response.text();
+            return res.response.text().trim();
         } catch (err) {
             logger.error('[GEMINI] quickReply erreur:', err.message);
             return personality.getErrorMessage('UNKNOWN');
         }
-    }
-
-    _parseResponse(raw) {
-        const jsonMatch = raw.match(/\{[\s\S]*"intent"[\s\S]*\}/);
-        if (jsonMatch) {
-            try {
-                const parsed = JSON.parse(jsonMatch[0]);
-                if (parsed.intent && parsed.response) {
-                    return { intent: parsed.intent, data: parsed.data || null, response: parsed.response };
-                }
-            } catch (_) {}
-        }
-        return { intent: null, response: raw };
     }
 
     clearHistory(userId) { this.histories.delete(userId); }
