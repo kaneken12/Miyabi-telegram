@@ -340,3 +340,4 @@ class MessageHandler {
 }
 
 module.exports = new MessageHandler();
+
