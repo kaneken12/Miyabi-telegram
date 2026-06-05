@@ -1,6 +1,6 @@
 // ============================================================
 //  src/handlers/messageHandler.js — Miyabi Telegram v2
-//  Deux appels Gemini séparés : intention + réponse
+//  Un seul appel Gemini — erreurs silencieuses en groupe
 // ============================================================
 
 const gemini             = require('../core/gemini');
@@ -14,7 +14,6 @@ const axios              = require('axios');
 const path               = require('path');
 const fs                 = require('fs');
 
-// Import lazy pour éviter les dépendances circulaires
 function getStickerForMood(name) {
     try { return require('../core/bot').getStickerForMood(name); }
     catch (_) { return null; }
@@ -90,13 +89,11 @@ class MessageHandler {
 
             await bot.sendChatAction(chatId, 'typing');
 
-            // ── APPEL 1 : Détecter l'intention ────────────
-            const intentResult = await gemini.detectIntent(cleanText);
-            const intent       = intentResult.intent;
-            const data         = intentResult.data;
-
-            // ── APPEL 2 : Réponse de Miyabi ───────────────
-            const response = await gemini.chat(userId, cleanText, userName);
+            // ── UN SEUL APPEL GEMINI ──────────────────────
+            const result   = await gemini.chat(userId, cleanText, userName);
+            const intent   = result.intent;
+            const data     = result.data;
+            const response = result.response;
 
             // ── ROUTER SELON L'INTENTION ──────────────────
             switch (intent) {
@@ -104,14 +101,14 @@ class MessageHandler {
                 case 'DOWNLOAD_VIDEO': {
                     const url = this._extractUrl(cleanText) || data;
                     await this._send(bot, chatId, msg, response);
-                    if (url) await this._downloadAndSend(bot, chatId, url, 'video');
+                    if (url) await this._downloadAndSend(bot, chatId, url, 'video', isGroup);
                     break;
                 }
 
                 case 'DOWNLOAD_AUDIO': {
                     const url = this._extractUrl(cleanText) || data;
                     await this._send(bot, chatId, msg, response);
-                    if (url) await this._downloadAndSend(bot, chatId, url, 'audio');
+                    if (url) await this._downloadAndSend(bot, chatId, url, 'audio', isGroup);
                     break;
                 }
 
@@ -122,7 +119,7 @@ class MessageHandler {
 
                 case 'WEB_SEARCH':
                     await this._send(bot, chatId, msg, response);
-                    await this._doSearch(bot, chatId, data || cleanText);
+                    await this._doSearch(bot, chatId, data || cleanText, isGroup);
                     break;
 
                 case 'GROUP_LOCK': {
@@ -130,7 +127,7 @@ class MessageHandler {
                     const isAdmin = await groupService.isUserAdmin(bot, chatId, userId);
                     if (!isAdmin && !isOwner) { await this._send(bot, chatId, msg, personality.getErrorMessage('NOT_AUTHORIZED')); return; }
                     const r = await groupService.lockGroup(bot, chatId);
-                    await this._send(bot, chatId, msg, r.success ? response : `Echec : ${r.error}`);
+                    await this._send(bot, chatId, msg, r.success ? response : personality.getErrorMessage('GROUP_FORBIDDEN'));
                     break;
                 }
 
@@ -139,7 +136,7 @@ class MessageHandler {
                     const isAdmin = await groupService.isUserAdmin(bot, chatId, userId);
                     if (!isAdmin && !isOwner) { await this._send(bot, chatId, msg, personality.getErrorMessage('NOT_AUTHORIZED')); return; }
                     const r = await groupService.unlockGroup(bot, chatId);
-                    await this._send(bot, chatId, msg, r.success ? response : `Echec : ${r.error}`);
+                    await this._send(bot, chatId, msg, r.success ? response : personality.getErrorMessage('GROUP_FORBIDDEN'));
                     break;
                 }
 
@@ -163,6 +160,7 @@ class MessageHandler {
 
         } catch (err) {
             logger.error('[HANDLER] Erreur:', err.message);
+            // Ne jamais afficher les erreurs système dans un groupe
         }
     }
 
@@ -173,7 +171,7 @@ class MessageHandler {
             const sizeMB = ((msg.video?.file_size || msg.document?.file_size || 0) / (1024 * 1024)).toFixed(1);
 
             const reply = await gemini.quickReply(
-                `${userName} t'envoie une vidéo (${sizeMB} MB). Réponds brièvement que tu l'as reçue et demande ce qu'il veut : garder en vidéo ou extraire l'audio MP3.`
+                `${userName} t'envoie une vidéo (${sizeMB} MB). Réponds brièvement et demande ce qu'il veut : garder en vidéo ou extraire l'audio MP3.`
             );
 
             await bot.sendMessage(chatId, reply, {
@@ -190,7 +188,7 @@ class MessageHandler {
         }
     }
 
-    // ── Audio/vocal reçu → retélécharger proprement ──────────
+    // ── Audio/vocal reçu ─────────────────────────────────────
     async _handleReceivedAudio(bot, msg, chatId) {
         const waiting = await bot.sendMessage(chatId, '⏳ Traitement audio...', {
             reply_to_message_id: msg.message_id,
@@ -210,21 +208,18 @@ class MessageHandler {
             await new Promise((res, rej) => { writer.on('finish', res); writer.on('error', rej); });
 
             await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
-
             await bot.sendAudio(chatId, outPath, {
                 caption:    `🎵 ${title}${performer ? ' — ' + performer : ''}\n_${sizeMB} MB_`,
                 parse_mode: 'Markdown',
-                title,
-                performer,
+                title, performer,
                 reply_to_message_id: msg.message_id,
             });
-
             downloadService.cleanup(outPath);
 
         } catch (err) {
             logger.error('[HANDLER] _handleReceivedAudio erreur:', err.message);
             await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
-            await bot.sendMessage(chatId, personality.getErrorMessage('DOWNLOAD_FAILED'));
+            // Pas de message d'erreur en groupe
         }
     }
 
@@ -250,7 +245,6 @@ class MessageHandler {
             } catch (err) {
                 logger.error('[CALLBACK] keep_video erreur:', err.message);
                 await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
-                await bot.sendMessage(chatId, personality.getErrorMessage('DOWNLOAD_FAILED'));
             }
         }
 
@@ -267,19 +261,18 @@ class MessageHandler {
                 const result = await downloadService.convertToAudio(tmpVid);
                 await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
                 downloadService.cleanup(tmpVid);
-                if (!result.success) { await bot.sendMessage(chatId, personality.getErrorMessage('DOWNLOAD_FAILED')); return; }
+                if (!result.success) return;
                 await bot.sendAudio(chatId, result.path, { caption: '🎵 Conversion terminée.' });
                 downloadService.cleanup(result.path);
             } catch (err) {
                 logger.error('[CALLBACK] to_audio erreur:', err.message);
                 await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
-                await bot.sendMessage(chatId, personality.getErrorMessage('DOWNLOAD_FAILED'));
             }
         }
     }
 
     // ── Télécharger depuis lien ou recherche ──────────────────
-    async _downloadAndSend(bot, chatId, urlOrQuery, type) {
+    async _downloadAndSend(bot, chatId, urlOrQuery, type, isGroup = false) {
         const waiting = await bot.sendMessage(chatId, `⏳ ${type === 'audio' ? 'Extraction audio' : 'Téléchargement'}...`);
         try {
             const result = type === 'audio'
@@ -289,6 +282,7 @@ class MessageHandler {
             await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
 
             if (!result.success) {
+                // En groupe : message d'erreur discret
                 const errMsg = result.error === 'FILE_TOO_LARGE'
                     ? `Trop lourd (${result.sizeMB} MB). Max 50 MB.`
                     : personality.getErrorMessage('DOWNLOAD_FAILED');
@@ -307,16 +301,19 @@ class MessageHandler {
         } catch (err) {
             logger.error('[HANDLER] _downloadAndSend erreur:', err.message);
             await bot.deleteMessage(chatId, waiting.message_id).catch(() => {});
-            await bot.sendMessage(chatId, personality.getErrorMessage('DOWNLOAD_FAILED'));
         }
     }
 
     // ── Recherche web ─────────────────────────────────────────
-    async _doSearch(bot, chatId, query) {
-        const result = await searchService.search(query);
-        if (!result.success) { await bot.sendMessage(chatId, personality.getErrorMessage('SEARCH_FAILED')); return; }
-        const text = `🔍 *${result.title}*\n\n${result.text}` + (result.url ? `\n\n[Source](${result.url})` : '');
-        await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', disable_web_page_preview: false });
+    async _doSearch(bot, chatId, query, isGroup = false) {
+        try {
+            const result = await searchService.search(query);
+            if (!result.success) return;
+            const text = `🔍 *${result.title}*\n\n${result.text}` + (result.url ? `\n\n[Source](${result.url})` : '');
+            await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', disable_web_page_preview: false });
+        } catch (err) {
+            logger.error('[HANDLER] _doSearch erreur:', err.message);
+        }
     }
 
     // ── Envoyer message + sticker ─────────────────────────────
