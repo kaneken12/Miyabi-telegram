@@ -73,8 +73,23 @@ class DownloadService {
 
     // ── Source yt-dlp (URL ou recherche textuelle) ────────────
     _buildSource(urlOrQuery) {
-        if (urlOrQuery.startsWith('http')) return urlOrQuery;
-        return `ytsearch1:${urlOrQuery}`;
+        if (!urlOrQuery.startsWith('http')) return 'ytsearch1:' + urlOrQuery;
+        return urlOrQuery;
+    }
+
+    _buildVideoArgs(source, outPath) {
+        const isPinterest = /pinterest\.com|pin\.it/i.test(source);
+        if (isPinterest) {
+            return [
+                source, '-f', 'best', '-o', outPath, '--no-playlist',
+                '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            ];
+        }
+        return [
+            source,
+            '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]',
+            '--merge-output-format', 'mp4', '-o', outPath, '--no-playlist',
+        ];
     }
 
     // ── Infos sans télécharger ───────────────────────────────
@@ -99,13 +114,7 @@ class DownloadService {
         logger.info(`[DL] 📥 Vidéo : ${urlOrQuery}`);
 
         try {
-            await this.ytdlp.execPromise([
-                source,
-                '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]',
-                '--merge-output-format', 'mp4',
-                '-o', outPath,
-                '--no-playlist',
-            ]);
+            await this.ytdlp.execPromise(this._buildVideoArgs(source, outPath));
 
             if (!fs.existsSync(outPath)) return { success: false, error: 'FILE_NOT_FOUND' };
 
