@@ -1,11 +1,12 @@
 // ============================================================
 //  src/core/gemini.js — Miyabi Telegram v2
-//  UN seul appel Gemini — parsing robuste
+//  Mémoire persistante JSON intégrée
 // ============================================================
 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const logger      = require('../utils/logger');
 const personality = require('./personality');
+const memory      = require('../utils/memory');
 
 const INTENT_PROMPT = `
 INSTRUCTIONS STRICTES :
@@ -24,39 +25,32 @@ Actions reconnues :
 - GROUP_INFO : infos du groupe. data = "info"
 - RESET_CHAT : réinitialiser conversation. data = "reset"
 
-Exemples stricts :
+Exemples :
 Message: "envoie Careless de Neffex"
-Réponse: {"intent":"DOWNLOAD_AUDIO","data":"Neffex Careless","response":"*soupir* Tiens, White."}
+Réponse: {"intent":"DOWNLOAD_AUDIO","data":"Neffex Careless","response":"*soupir* Tiens."}
 
 Message: "bonjour comment tu vas"
-Réponse: Bien. Qu'est-ce que tu veux, White ?
+Réponse: Bien. Qu'est-ce que tu veux ?
 
-Message: "cherche les dernières news"
-Réponse: {"intent":"WEB_SEARCH","data":"latest news today","response":"Je cherche ça, White."}
-
-RAPPEL : JSON = action détectée. Texte pur = conversation normale. Jamais les deux mélangés.
+RAPPEL : JSON = action. Texte pur = conversation. Jamais les deux mélangés.
 `;
 
 class GeminiService {
     constructor() {
-        this.genAI     = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-        this.model     = this.genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-        this.histories = new Map();
-        this.userNames = new Map();
+        this.genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+        this.model = this.genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
     }
 
-    setUserName(userId, name) { this.userNames.set(userId, name); }
-    getUserName(userId)       { return this.userNames.get(userId) || null; }
-    isMother(userId)          { return String(userId) === String(process.env.MOTHER_ID); }
+    isMother(userId) { return String(userId) === String(process.env.MOTHER_ID); }
 
-    // ── Un seul appel : réponse + intent combinés ─────────────
+    // ── Chat principal avec mémoire persistante ───────────────
     async chat(userId, userText, userName) {
         try {
-            if (userName && !this.userNames.has(userId))
-                this.userNames.set(userId, userName);
+            // Mettre à jour les infos utilisateur
+            if (userName) memory.setUser(userId, { name: userName });
 
-            if (!this.histories.has(userId)) this.histories.set(userId, []);
-            const history = this.histories.get(userId);
+            // Récupérer l'historique depuis la mémoire persistante
+            const history = memory.getHistory(userId);
 
             const chat = this.model.startChat({
                 history,
@@ -72,10 +66,9 @@ class GeminiService {
             const res    = await chat.sendMessage(prompt);
             const raw    = res.response.text().trim();
 
-            // Sauvegarder dans l'historique
-            history.push({ role: 'user',  parts: [{ text: userText }] });
-            history.push({ role: 'model', parts: [{ text: raw }] });
-            if (history.length > 40) history.splice(0, 2);
+            // Sauvegarder dans la mémoire persistante
+            memory.addToHistory(userId, 'user',  userText);
+            memory.addToHistory(userId, 'model', raw);
 
             return this._parse(raw);
 
@@ -98,15 +91,16 @@ class GeminiService {
         }
     }
 
+    // ── Récupérer le nom mémorisé ─────────────────────────────
+    getUserName(userId) { return memory.getUserName(userId); }
+    setUserName(userId, name) { memory.setUser(userId, { name }); }
+
     // ── Parser robuste ───────────────────────────────────────
     _parse(raw) {
-        // Nettoyer backticks
         const cleaned = raw.replace(/```json/g, '').replace(/```/g, '').trim();
 
-        // Chercher un JSON avec "intent"
         const start = cleaned.indexOf('{"intent"');
         if (start !== -1) {
-            // Trouver la fin du JSON
             let depth = 0, end = -1;
             for (let i = start; i < cleaned.length; i++) {
                 if (cleaned[i] === '{') depth++;
@@ -115,25 +109,22 @@ class GeminiService {
             if (end > start) {
                 try {
                     const parsed = JSON.parse(cleaned.slice(start, end));
-                    if (parsed.intent && parsed.response) {
+                    if (parsed.intent && parsed.response)
                         return { intent: parsed.intent, data: parsed.data || null, response: parsed.response };
-                    }
                 } catch (_) {}
             }
         }
 
-        // Essayer de parser toute la réponse
         try {
             const parsed = JSON.parse(cleaned);
             if (parsed.intent && parsed.response)
                 return { intent: parsed.intent, data: parsed.data || null, response: parsed.response };
         } catch (_) {}
 
-        // Réponse texte normale
         return { intent: null, data: null, response: raw };
     }
 
-    clearHistory(userId) { this.histories.delete(userId); }
+    clearHistory(userId) { memory.clearHistory(userId); }
 }
 
 module.exports = new GeminiService();
