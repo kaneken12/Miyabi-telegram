@@ -50,6 +50,9 @@ const MOODS = [
     { name: 'irritée',      weight: 20 },
     { name: 'froide',       weight: 15 },
     { name: 'détendue',     weight: 10 },
+    { name: 'contente',     weight: 15 },
+    { name: 'fatiguée',     weight: 10 },
+    { name: 'tsundere',     weight: 10 },
 ];
 
 class Personality {
