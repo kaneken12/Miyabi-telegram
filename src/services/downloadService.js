@@ -1,6 +1,7 @@
 // ============================================================
 //  src/services/downloadService.js
-//  Compatible Termux + Render (pas de dépendances système)
+//  Compatible Termux + Render
+//  Facebook et Pinterest corrigés
 // ============================================================
 
 const YTDlpWrap = require('yt-dlp-wrap').default;
@@ -14,15 +15,12 @@ const MAX_SIZE_MB = 50;
 
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
-// ── Configurer ffmpeg selon l'environnement ──────────────────
-// Sur Render : utilise @ffmpeg-installer/ffmpeg (binaire npm)
-// Sur Termux : utilise ffmpeg système (déjà installé)
+// ── Configurer ffmpeg ────────────────────────────────────────
 try {
     const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
     ffmpeg.setFfmpegPath(ffmpegInstaller.path);
     logger.info('[DL] ffmpeg via @ffmpeg-installer');
 } catch (_) {
-    // Termux — ffmpeg système déjà dispo dans le PATH
     logger.info('[DL] ffmpeg via système (Termux)');
 }
 
@@ -36,6 +34,13 @@ function detectPlatform(url) {
     return 'YouTube';
 }
 
+// ── User-Agents par plateforme ───────────────────────────────
+const USER_AGENTS = {
+    facebook:  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    pinterest: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+    default:   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+};
+
 class DownloadService {
     constructor() {
         this.ytdlp      = new YTDlpWrap();
@@ -43,7 +48,6 @@ class DownloadService {
         this._initYtdlp();
     }
 
-    // ── Initialiser yt-dlp ──────────────────────────────────
     async _initYtdlp() {
         try {
             await this.ytdlp.execPromise(['--version']);
@@ -51,13 +55,12 @@ class DownloadService {
             logger.info('[DL] yt-dlp système détecté');
         } catch (_) {
             try {
-                const binDir = path.join(__dirname, '../../bin');
+                const binDir  = path.join(__dirname, '../../bin');
                 if (!fs.existsSync(binDir)) fs.mkdirSync(binDir, { recursive: true });
                 const binPath = path.join(binDir, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
                 logger.info('[DL] Téléchargement yt-dlp...');
                 await YTDlpWrap.downloadFromGithub(binPath);
                 this.ytdlp = new YTDlpWrap(binPath);
-                // Rendre exécutable sur Linux
                 if (process.platform !== 'win32') {
                     const { execSync } = require('child_process');
                     execSync(`chmod +x ${binPath}`);
@@ -71,24 +74,54 @@ class DownloadService {
         }
     }
 
-    // ── Source yt-dlp (URL ou recherche textuelle) ────────────
+    // ── Source yt-dlp ────────────────────────────────────────
     _buildSource(urlOrQuery) {
         if (!urlOrQuery.startsWith('http')) return 'ytsearch1:' + urlOrQuery;
         return urlOrQuery;
     }
 
+    // ── Args selon la plateforme ─────────────────────────────
     _buildVideoArgs(source, outPath) {
-        const isPinterest = /pinterest\.com|pin\.it/i.test(source);
-        if (isPinterest) {
+        const platform    = detectPlatform(source).toLowerCase();
+        const isFacebook  = platform === 'facebook';
+        const isPinterest = platform === 'pinterest';
+
+        const baseArgs = [source, '-o', outPath, '--no-playlist'];
+
+        if (isFacebook) {
             return [
-                source, '-f', 'best', '-o', outPath, '--no-playlist',
-                '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                ...baseArgs,
+                '-f', 'best[ext=mp4]/best',
+                '--add-header', `User-Agent:${USER_AGENTS.facebook}`,
+                '--add-header', 'Accept-Language:en-US,en;q=0.9',
+                '--no-check-certificate',
             ];
         }
+
+        if (isPinterest) {
+            return [
+                ...baseArgs,
+                '-f', 'best',
+                '--add-header', `User-Agent:${USER_AGENTS.pinterest}`,
+                '--no-check-certificate',
+            ];
+        }
+
+        // YouTube et autres
+        return [
+            ...baseArgs,
+            '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]',
+            '--merge-output-format', 'mp4',
+        ];
+    }
+
+    _buildAudioArgs(source, outPath) {
         return [
             source,
-            '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]',
-            '--merge-output-format', 'mp4', '-o', outPath, '--no-playlist',
+            '-x', '--audio-format', 'mp3',
+            '--audio-quality', '192K',
+            '-o', outPath,
+            '--no-playlist',
         ];
     }
 
@@ -102,36 +135,47 @@ class DownloadService {
                 uploader: info.uploader || '',
                 filesize: info.filesize_approx || 0,
                 platform: detectPlatform(info.webpage_url || urlOrQuery),
-                url:      info.webpage_url || urlOrQuery,
             };
         } catch { return null; }
     }
 
     // ── Télécharger une vidéo ────────────────────────────────
     async downloadVideo(urlOrQuery) {
-        const source  = this._buildSource(urlOrQuery);
-        const outPath = path.join(TMP_DIR, `miyabi_${Date.now()}.mp4`);
-        logger.info(`[DL] 📥 Vidéo : ${urlOrQuery}`);
+        const source   = this._buildSource(urlOrQuery);
+        const platform = detectPlatform(source);
+        const outPath  = path.join(TMP_DIR, `miyabi_${Date.now()}.mp4`);
+        logger.info(`[DL] 📥 Vidéo ${platform} : ${urlOrQuery}`);
 
         try {
             await this.ytdlp.execPromise(this._buildVideoArgs(source, outPath));
 
-            if (!fs.existsSync(outPath)) return { success: false, error: 'FILE_NOT_FOUND' };
+            // Chercher le fichier (yt-dlp peut changer l'extension)
+            let finalPath = outPath;
+            if (!fs.existsSync(outPath)) {
+                const base = outPath.replace('.mp4', '');
+                const exts = ['.mp4', '.mkv', '.webm', '.mov'];
+                for (const ext of exts) {
+                    if (fs.existsSync(base + ext)) { finalPath = base + ext; break; }
+                }
+            }
 
-            const sizeMB = fs.statSync(outPath).size / (1024 * 1024);
+            if (!fs.existsSync(finalPath)) return { success: false, error: 'FILE_NOT_FOUND' };
+
+            const sizeMB = fs.statSync(finalPath).size / (1024 * 1024);
             if (sizeMB > MAX_SIZE_MB) {
-                fs.unlinkSync(outPath);
+                fs.unlinkSync(finalPath);
                 return { success: false, error: 'FILE_TOO_LARGE', sizeMB: sizeMB.toFixed(1) };
             }
 
             const info = await this.getInfo(source).catch(() => null);
             return {
                 success:  true,
-                path:     outPath,
+                path:     finalPath,
                 title:    info?.title    || urlOrQuery,
-                platform: info?.platform || 'YouTube',
+                platform: info?.platform || platform,
                 sizeMB:   sizeMB.toFixed(1),
             };
+
         } catch (err) {
             logger.error('[DL] downloadVideo erreur:', err.message);
             if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
@@ -146,13 +190,7 @@ class DownloadService {
         logger.info(`[DL] 🎵 Audio : ${urlOrQuery}`);
 
         try {
-            await this.ytdlp.execPromise([
-                source,
-                '-x', '--audio-format', 'mp3',
-                '--audio-quality', '192K',
-                '-o', outPath,
-                '--no-playlist',
-            ]);
+            await this.ytdlp.execPromise(this._buildAudioArgs(source, outPath));
 
             if (!fs.existsSync(outPath)) return { success: false, error: 'FILE_NOT_FOUND' };
 
@@ -165,6 +203,7 @@ class DownloadService {
                 platform: info?.platform || 'YouTube',
                 sizeMB:   sizeMB.toFixed(1),
             };
+
         } catch (err) {
             logger.error('[DL] downloadAudio erreur:', err.message);
             if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
