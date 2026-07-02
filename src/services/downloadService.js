@@ -1,7 +1,6 @@
 // ============================================================
 //  src/services/downloadService.js
-//  Compatible Termux + Render
-//  Facebook et Pinterest corrigés
+//  Compatible Termux + Render — ffmpeg path forcé
 // ============================================================
 
 const YTDlpWrap = require('yt-dlp-wrap').default;
@@ -11,17 +10,21 @@ const fs        = require('fs');
 const logger    = require('../utils/logger');
 
 const TMP_DIR     = path.join(__dirname, '../../tmp');
+const BIN_DIR     = path.join(__dirname, '../../bin');
 const MAX_SIZE_MB = 50;
 
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
+if (!fs.existsSync(BIN_DIR)) fs.mkdirSync(BIN_DIR, { recursive: true });
 
 // ── Configurer ffmpeg ────────────────────────────────────────
+let ffmpegPath = null;
 try {
-    const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
-    ffmpeg.setFfmpegPath(ffmpegInstaller.path);
-    logger.info('[DL] ffmpeg via @ffmpeg-installer');
+    const installer = require('@ffmpeg-installer/ffmpeg');
+    ffmpegPath = installer.path;
+    ffmpeg.setFfmpegPath(ffmpegPath);
+    logger.info('[DL] ffmpeg via @ffmpeg-installer : ' + ffmpegPath);
 } catch (_) {
-    logger.info('[DL] ffmpeg via système (Termux)');
+    logger.info('[DL] ffmpeg via système');
 }
 
 function detectPlatform(url) {
@@ -34,7 +37,6 @@ function detectPlatform(url) {
     return 'YouTube';
 }
 
-// ── User-Agents par plateforme ───────────────────────────────
 const USER_AGENTS = {
     facebook:  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     pinterest: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
@@ -45,52 +47,69 @@ class DownloadService {
     constructor() {
         this.ytdlp      = new YTDlpWrap();
         this.ytdlpReady = false;
+        this.ytdlpPath  = null;
         this._initYtdlp();
     }
 
     async _initYtdlp() {
+        // 1. Essayer yt-dlp système
         try {
-            await this.ytdlp.execPromise(['--version']);
+            const { execSync } = require('child_process');
+            execSync('yt-dlp --version', { stdio: 'ignore' });
             this.ytdlpReady = true;
+            this.ytdlpPath  = 'yt-dlp';
             logger.info('[DL] yt-dlp système détecté');
-        } catch (_) {
-            try {
-                const binDir  = path.join(__dirname, '../../bin');
-                if (!fs.existsSync(binDir)) fs.mkdirSync(binDir, { recursive: true });
-                const binPath = path.join(binDir, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-                logger.info('[DL] Téléchargement yt-dlp...');
-                await YTDlpWrap.downloadFromGithub(binPath);
-                this.ytdlp = new YTDlpWrap(binPath);
-                if (process.platform !== 'win32') {
-                    const { execSync } = require('child_process');
-                    execSync(`chmod +x ${binPath}`);
-                }
-                this.ytdlpReady = true;
-                logger.info('[DL] yt-dlp téléchargé avec succès');
-            } catch (err) {
-                logger.error('[DL] yt-dlp indisponible:', err.message);
-                this.ytdlpReady = false;
+            return;
+        } catch (_) {}
+
+        // 2. Essayer le binaire pré-téléchargé dans bin/
+        const binPath = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+        if (fs.existsSync(binPath)) {
+            this.ytdlp      = new YTDlpWrap(binPath);
+            this.ytdlpReady = true;
+            this.ytdlpPath  = binPath;
+            logger.info('[DL] yt-dlp binaire trouvé : ' + binPath);
+            return;
+        }
+
+        // 3. Télécharger le binaire
+        try {
+            logger.info('[DL] Téléchargement yt-dlp...');
+            await YTDlpWrap.downloadFromGithub(binPath);
+            if (process.platform !== 'win32') {
+                const { execSync } = require('child_process');
+                execSync(`chmod +x ${binPath}`);
             }
+            this.ytdlp      = new YTDlpWrap(binPath);
+            this.ytdlpReady = true;
+            this.ytdlpPath  = binPath;
+            logger.info('[DL] yt-dlp téléchargé : ' + binPath);
+        } catch (err) {
+            logger.error('[DL] yt-dlp indisponible:', err.message);
+            this.ytdlpReady = false;
         }
     }
 
-    // ── Source yt-dlp ────────────────────────────────────────
     _buildSource(urlOrQuery) {
         if (!urlOrQuery.startsWith('http')) return 'ytsearch1:' + urlOrQuery;
         return urlOrQuery;
     }
 
-    // ── Args selon la plateforme ─────────────────────────────
+    // ── Args selon plateforme ────────────────────────────────
     _buildVideoArgs(source, outPath) {
         const platform    = detectPlatform(source).toLowerCase();
         const isFacebook  = platform === 'facebook';
         const isPinterest = platform === 'pinterest';
+        const verbose     = process.env.YTDLP_VERBOSE === 'true' ? ['-v'] : [];
 
-        const baseArgs = [source, '-o', outPath, '--no-playlist'];
+        // Ajouter le chemin ffmpeg si disponible
+        const ffmpegArgs = ffmpegPath ? ['--ffmpeg-location', path.dirname(ffmpegPath)] : [];
+
+        const base = [...verbose, source, '-o', outPath, '--no-playlist', ...ffmpegArgs];
 
         if (isFacebook) {
             return [
-                ...baseArgs,
+                ...base,
                 '-f', 'best[ext=mp4]/best',
                 '--add-header', `User-Agent:${USER_AGENTS.facebook}`,
                 '--add-header', 'Accept-Language:en-US,en;q=0.9',
@@ -100,28 +119,32 @@ class DownloadService {
 
         if (isPinterest) {
             return [
-                ...baseArgs,
+                ...base,
                 '-f', 'best',
                 '--add-header', `User-Agent:${USER_AGENTS.pinterest}`,
                 '--no-check-certificate',
             ];
         }
 
-        // YouTube et autres
+        // YouTube et autres — format simplifié sans merge pour éviter le besoin de ffmpeg
         return [
-            ...baseArgs,
-            '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]',
-            '--merge-output-format', 'mp4',
+            ...base,
+            '-f', 'best[ext=mp4]/best[height<=720]/best',
+            '--no-playlist',
         ];
     }
 
     _buildAudioArgs(source, outPath) {
+        const ffmpegArgs = ffmpegPath ? ['--ffmpeg-location', path.dirname(ffmpegPath)] : [];
+        const verbose    = process.env.YTDLP_VERBOSE === 'true' ? ['-v'] : [];
         return [
+            ...verbose,
             source,
             '-x', '--audio-format', 'mp3',
             '--audio-quality', '192K',
             '-o', outPath,
             '--no-playlist',
+            ...ffmpegArgs,
         ];
     }
 
@@ -141,25 +164,34 @@ class DownloadService {
 
     // ── Télécharger une vidéo ────────────────────────────────
     async downloadVideo(urlOrQuery) {
+        if (!this.ytdlpReady) {
+            logger.error('[DL] yt-dlp non disponible');
+            return { success: false, error: 'DOWNLOAD_FAILED' };
+        }
+
         const source   = this._buildSource(urlOrQuery);
         const platform = detectPlatform(source);
         const outPath  = path.join(TMP_DIR, `miyabi_${Date.now()}.mp4`);
         logger.info(`[DL] 📥 Vidéo ${platform} : ${urlOrQuery}`);
 
         try {
-            await this.ytdlp.execPromise(this._buildVideoArgs(source, outPath));
+            const args = this._buildVideoArgs(source, outPath);
+            logger.info('[DL] Args: ' + args.join(' '));
+            await this.ytdlp.execPromise(args);
 
-            // Chercher le fichier (yt-dlp peut changer l'extension)
+            // Chercher le fichier final (yt-dlp peut changer l'extension)
             let finalPath = outPath;
             if (!fs.existsSync(outPath)) {
                 const base = outPath.replace('.mp4', '');
-                const exts = ['.mp4', '.mkv', '.webm', '.mov'];
-                for (const ext of exts) {
+                for (const ext of ['.mp4', '.mkv', '.webm', '.mov', '.avi']) {
                     if (fs.existsSync(base + ext)) { finalPath = base + ext; break; }
                 }
             }
 
-            if (!fs.existsSync(finalPath)) return { success: false, error: 'FILE_NOT_FOUND' };
+            if (!fs.existsSync(finalPath)) {
+                logger.error('[DL] Fichier introuvable après téléchargement');
+                return { success: false, error: 'FILE_NOT_FOUND' };
+            }
 
             const sizeMB = fs.statSync(finalPath).size / (1024 * 1024);
             if (sizeMB > MAX_SIZE_MB) {
@@ -185,14 +217,24 @@ class DownloadService {
 
     // ── Télécharger uniquement l'audio ───────────────────────
     async downloadAudio(urlOrQuery) {
+        if (!this.ytdlpReady) {
+            logger.error('[DL] yt-dlp non disponible');
+            return { success: false, error: 'DOWNLOAD_FAILED' };
+        }
+
         const source  = this._buildSource(urlOrQuery);
         const outPath = path.join(TMP_DIR, `miyabi_${Date.now()}.mp3`);
         logger.info(`[DL] 🎵 Audio : ${urlOrQuery}`);
 
         try {
-            await this.ytdlp.execPromise(this._buildAudioArgs(source, outPath));
+            const args = this._buildAudioArgs(source, outPath);
+            logger.info('[DL] Args: ' + args.join(' '));
+            await this.ytdlp.execPromise(args);
 
-            if (!fs.existsSync(outPath)) return { success: false, error: 'FILE_NOT_FOUND' };
+            if (!fs.existsSync(outPath)) {
+                logger.error('[DL] Fichier audio introuvable');
+                return { success: false, error: 'FILE_NOT_FOUND' };
+            }
 
             const info   = await this.getInfo(source).catch(() => null);
             const sizeMB = fs.statSync(outPath).size / (1024 * 1024);
@@ -234,7 +276,6 @@ class DownloadService {
         });
     }
 
-    // ── Nettoyage tmp > 15 min ───────────────────────────────
     cleanTmp() {
         const now = Date.now();
         try {
