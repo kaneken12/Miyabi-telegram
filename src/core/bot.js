@@ -1,3 +1,7 @@
+// ============================================================
+//  src/core/bot.js — Miyabi Telegram Core v2
+// ============================================================
+
 const TelegramBot     = require('node-telegram-bot-api');
 const logger          = require('../utils/logger');
 const personality     = require('./personality');
@@ -7,7 +11,6 @@ const downloadService = require('../services/downloadService');
 
 let bot = null;
 
-// ── Stickers par humeur ──────────────────────────────────────
 const MOOD_STICKERS = {
     indifferente: 'CAACAgQAAxkBAAIBMGoiS9myezRM_TPQuo1LbLBgjf88AAIqIgACCabgUNEa-TD7l9zZOwQ',
     sarcastique:  'CAACAgQAAxkBAAIBKGoiS8QfYgyJK6k9nFqa2wQCEu48AAIfIQACqxbhUFmPgh_QGVQ8OwQ',
@@ -19,18 +22,12 @@ const MOOD_STICKERS = {
     fatiguee:     'CAACAgQAAxkBAAIBNmoiS--NbsUYcJojw0dpvrSxUCD1AAK9HAAC3IrpUCzhP1U7-X6TOwQ',
 };
 
-// Normaliser le nom d'humeur (supprimer accents)
 function normalizeMood(name) {
-    return name
-        .toLowerCase()
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .replace(/[^a-z]/g, '');
+    return name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z]/g, '');
 }
 
 function getStickerForMood(moodName) {
-    const key = normalizeMood(moodName);
-    return MOOD_STICKERS[key] || null;
+    return MOOD_STICKERS[normalizeMood(moodName)] || null;
 }
 
 async function setupBot() {
@@ -51,7 +48,7 @@ async function setupBot() {
                 await bot.sendMessage(ownerChatId, '...En ligne.');
                 const sticker = getStickerForMood(personality.getCurrentMood().name);
                 if (sticker) await bot.sendSticker(ownerChatId, sticker);
-            } catch (e) { logger.warn('Message owner échoué:', e.message); }
+            } catch (_) {}
         }, 2000);
     }
 
@@ -70,8 +67,8 @@ async function setupBot() {
         catch (err) { logger.error('[BOT] callback_query:', err.message); }
     });
 
-    bot.on('polling_error', (err) => logger.error('Polling erreur:', err.message));
-    bot.on('error',         (err) => logger.error('Erreur:', err.message));
+    bot.on('polling_error', (err) => logger.error('[BOT] Polling:', err.message));
+    bot.on('error',         (err) => logger.error('[BOT] Erreur:', err.message));
 
     return bot;
 }
