@@ -1,27 +1,26 @@
 // ============================================================
-//  src/utils/logger.js
-//  Compatible Render (JSON) et Termux (pretty)
+//  src/utils/logger.js — Compatible Render + Termux
 // ============================================================
 
-const pino = require('pino');
+const isRender = !!process.env.RENDER;
 
-// Sur Render : pas de TTY → logs JSON bruts
-// Sur Termux : TTY → logs colorisés
-const isRender  = !!process.env.RENDER;
-const isPretty  = process.stdout.isTTY || !isRender;
-
-const logger = pino(
-    { level: 'info' },
-    isPretty
-        ? pino.transport({
-              target: 'pino-pretty',
-              options: {
-                  colorize:      true,
-                  translateTime: 'SYS:dd-mm-yyyy HH:MM:ss',
-                  ignore:        'pid,hostname',
-              },
-          })
-        : process.stdout
-);
+let logger;
+if (isRender) {
+    logger = {
+        info:  (...a) => console.log('[INFO]',  ...a),
+        warn:  (...a) => console.warn('[WARN]',  ...a),
+        error: (...a) => console.error('[ERROR]', ...a),
+        debug: (...a) => console.log('[DEBUG]', ...a),
+    };
+} else {
+    const pino = require('pino');
+    logger = pino({
+        level: 'info',
+        transport: {
+            target: 'pino-pretty',
+            options: { colorize: true, translateTime: 'SYS:dd-mm-yyyy HH:MM:ss', ignore: 'pid,hostname' },
+        },
+    });
+}
 
 module.exports = logger;
