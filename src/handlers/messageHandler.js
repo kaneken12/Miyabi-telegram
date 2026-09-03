@@ -105,6 +105,36 @@ function getWalletResponse(action, mood, data = {}) {
     return moodResponses[mood] || moodResponses['froide'] || 'Fait.';
 }
 
+// Parser pour créer plusieurs fiches en masse
+function parseMultipleWallets(text) {
+    const players = [];
+    // Diviser par "Nom:" pour séparer chaque joueur
+    const blocks = text.split(/(?=Nom\s*:)/i).filter(b => b.trim());
+
+    for (const block of blocks) {
+        try {
+            const nom   = block.match(/Nom\s*:\s*(.+)/i)?.[1]?.trim();
+            const pseudo = block.match(/Pseudo\s*:\s*(.+)/i)?.[1]?.trim();
+            const classe = block.match(/Classe\s*:\s*(.+)/i)?.[1]?.trim();
+
+            // Extraire abyss coins — supprimer emojis et espaces
+            const acMatch = block.match(/Abyss\s*coin[s]?\s*:\s*[🪙]?\s*([\d\s.,]+)/i);
+            const acStr   = acMatch?.[1]?.replace(/[\s.]/g, '').replace(',', '.') || '0';
+            const abyssCoins = parseInt(parseFloat(acStr)) || 0;
+
+            // Extraire gems
+            const gemMatch = block.match(/Gem[s]?\s*:\s*[💎]?\s*([\d\s.,]+)/i);
+            const gemStr   = gemMatch?.[1]?.replace(/[\s.]/g, '').replace(',', '.') || '0';
+            const gems     = parseInt(parseFloat(gemStr)) || 0;
+
+            if (nom && pseudo && classe) {
+                players.push({ nom, pseudo, classe, gems, abyssCoins });
+            }
+        } catch (_) {}
+    }
+    return players;
+}
+
 function getStickerForMood(name) {
     try { return require('../core/bot').getStickerForMood(name); }
     catch (_) { return null; }
@@ -240,21 +270,51 @@ class MessageHandler {
                 case 'WALLET_CREATE': {
                     if (!isAdmin) { await this._send(bot, chatId, msg, personality.getErrorMessage('NOT_AUTHORIZED')); return; }
                     try {
-                        const playerData = typeof data === 'string' ? JSON.parse(data) : data;
-                        const adminName  = getAdminName(userId);
-                        const r = walletService.createWallet(userId, playerData, adminName);
-                        if (!r.success) {
-                            const errMsg = r.error === 'ALREADY_EXISTS'
-                                ? `La fiche de *${r.pseudo}* existe déjà.`
-                                : personality.getErrorMessage('NOT_AUTHORIZED');
-                            await this._send(bot, chatId, msg, errMsg, true);
-                            return;
+                        const adminName = getAdminName(userId);
+                        const mood      = personality.getCurrentMood().name;
+
+                        // Détecter si c'est une création en masse (plusieurs blocs "Nom:")
+                        const multiPlayers = parseMultipleWallets(cleanText);
+
+                        if (multiPlayers.length > 1) {
+                            // Création en masse
+                            const created = [];
+                            const skipped = [];
+
+                            for (const playerData of multiPlayers) {
+                                const r = walletService.createWallet(userId, playerData, adminName);
+                                if (r.success) created.push(r.player);
+                                else if (r.error === 'ALREADY_EXISTS') skipped.push(playerData.pseudo);
+                            }
+
+                            // Réponse de Miyabi
+                            let reply = getWalletResponse('WALLET_CREATE', mood, { pseudo: created.length + ' joueurs' });
+                            if (skipped.length > 0) reply += ' (' + skipped.join(', ') + ' déjà existants)';
+                            await this._send(bot, chatId, msg, reply);
+
+                            // Envoyer chaque fiche séparément
+                            for (const player of created) {
+                                await bot.sendMessage(chatId, walletService.formatWallet(player, adminName), { parse_mode: 'Markdown' });
+                                await new Promise(r => setTimeout(r, 500));
+                            }
+
+                        } else {
+                            // Création simple
+                            const playerData = typeof data === 'string' ? JSON.parse(data) : data;
+                            const r = walletService.createWallet(userId, playerData, adminName);
+                            if (!r.success) {
+                                const errMsg = r.error === 'ALREADY_EXISTS'
+                                    ? 'La fiche de *' + r.pseudo + '* existe déjà.'
+                                    : personality.getErrorMessage('NOT_AUTHORIZED');
+                                await this._send(bot, chatId, msg, errMsg, true);
+                                return;
+                            }
+                            const reply = getWalletResponse('WALLET_CREATE', mood, { pseudo: r.player.pseudo });
+                            await this._send(bot, chatId, msg, reply);
+                            await bot.sendMessage(chatId, walletService.formatWallet(r.player, adminName), { parse_mode: 'Markdown' });
                         }
-                        const mood = personality.getCurrentMood().name;
-                        const reply = getWalletResponse('WALLET_CREATE', mood, { pseudo: r.player.pseudo });
-                        await this._send(bot, chatId, msg, reply);
-                        await bot.sendMessage(chatId, walletService.formatWallet(r.player, adminName), { parse_mode: 'Markdown' });
                     } catch (e) {
+                        logger.error('[WALLET] Create erreur:', e.message);
                         await this._send(bot, chatId, msg, 'Données invalides pour créer la fiche.');
                     }
                     break;
